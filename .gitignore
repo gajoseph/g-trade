@@ -1,0 +1,46 @@
+# Environment / secrets — never commit real credentials
+.env
+*.env
+.env.*
+!.env.example
+
+# JSON files (tokens, cache, data)
+*.json
+
+# Logs
+*.log
+trading_app.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/

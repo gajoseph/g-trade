@@ -1,0 +1,13 @@
+--trusted-host pypi.org 
+--trusted-host files.pythonhosted.org
+
+requests
+matplotlib 
+pandas 
+numpy 
+pillow 
+yfinance
+# scikit-learn
+# tensorflow  
+# keras
+python-dotenv

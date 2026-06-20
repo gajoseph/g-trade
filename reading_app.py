@@ -69,6 +69,7 @@ try:
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
     import matplotlib.patches as mpatches
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.figure import Figure
@@ -106,8 +107,8 @@ PORTFOLIO = {
 # Live earnings dates — populated automatically at startup
 EARNINGS_DATES = {}
 
-MONTHLY_GOAL = 1234
-ACCOUNT_SIZE = 123456
+MONTHLY_GOAL = 6000
+ACCOUNT_SIZE = 230000
 
 # SPMO-inspired strategy controls. Actual SPMO rebalances semiannually; this app
 # can refresh the momentum universe faster for active income scanning.
@@ -195,6 +196,12 @@ def fetch_quotes_yahoo(symbols):
                     or info.get("regularMarketPreviousClose")
                     or 0
                 )
+                volume = (
+                    info.get("lastVolume")
+                    or info.get("regularMarketVolume")
+                    or info.get("volume")
+                    or 0
+                )
                 if not curr_price or not prev_close:
                     hist = ticker.history(period="2d", interval="1d")
                     if len(hist) >= 2:
@@ -211,6 +218,7 @@ def fetch_quotes_yahoo(symbols):
                     "price":  round(curr_price, 2),
                     "change": round(change, 2),
                     "pct":    round(change_pct, 2),
+                    "volume": int(volume or 0),
                 }
             except Exception:
                 pass
@@ -241,6 +249,12 @@ def fetch_quotes_yahoo(symbols):
                     or info.get("regularMarketPreviousClose")
                     or 0
                 )
+                volume = (
+                    info.get("lastVolume")
+                    or info.get("regularMarketVolume")
+                    or info.get("volume")
+                    or 0
+                )
                 if not curr_price or not prev_close:
                     hist = ticker.history(period="2d", interval="1d")
                     if len(hist) >= 2:
@@ -257,6 +271,7 @@ def fetch_quotes_yahoo(symbols):
                     "price": round(curr_price, 2),
                     "change": round(change, 2),
                     "pct": round(change_pct, 2),
+                    "volume": int(volume or 0),
                 }
             except Exception:
                 pass
@@ -276,6 +291,80 @@ def fetch_history_yahoo(symbol):
     except Exception as e:
         print(f"Yahoo history error for {symbol}: {e}")
         return []
+
+def fetch_history_series_yahoo(symbol, period="2y"):
+    """Fetch dated price history from Yahoo Finance."""
+    if not YFINANCE_OK:
+        return []
+    try:
+        ticker = yf.Ticker(symbol, session=create_yahoo_session())
+        hist = ticker.history(period=period, interval="1d")
+        series = []
+        for idx, row in hist.iterrows():
+            dt = idx.to_pydatetime().date() if hasattr(idx, "to_pydatetime") else idx.date()
+            close = row.get("Close")
+            if close is not None:
+                series.append({"date": dt, "close": round(float(close), 2)})
+        return series
+    except Exception as e:
+        print(f"Yahoo history series error for {symbol}: {e}")
+        return []
+
+def fetch_earnings_timeline_yahoo(symbol, limit=12):
+    """Fetch historical and upcoming earnings dates from Yahoo when available."""
+    if not YFINANCE_OK or symbol in ETF_SYMBOLS:
+        return {"historical": [], "upcoming": None}
+    dates = []
+    try:
+        ticker = yf.Ticker(symbol, session=create_yahoo_session())
+        try:
+            df = ticker.get_earnings_dates(limit=limit)
+            if df is not None and len(df):
+                for idx in df.index.tolist():
+                    ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                    if hasattr(ts, "date"):
+                        dates.append(ts.date())
+        except Exception:
+            pass
+
+        try:
+            cal = ticker.calendar
+            if cal is not None and not cal.empty:
+                if hasattr(cal, "index") and "Earnings Date" in cal.index:
+                    cal_dates = cal.loc["Earnings Date"]
+                elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+                    cal_dates = cal["Earnings Date"]
+                else:
+                    cal_dates = None
+
+                if cal_dates is not None:
+                    if hasattr(cal_dates, "__iter__") and not isinstance(cal_dates, str):
+                        for item in cal_dates:
+                            if hasattr(item, "date"):
+                                dates.append(item.date())
+                    elif hasattr(cal_dates, "date"):
+                        dates.append(cal_dates.date())
+        except Exception:
+            pass
+    except Exception:
+        return {"historical": [], "upcoming": None}
+
+    unique_dates = sorted({d for d in dates if d})
+    today = datetime.now().date()
+    historical = [d for d in unique_dates if d <= today]
+    upcoming = next((d for d in unique_dates if d > today), None)
+    return {"historical": historical[-8:], "upcoming": upcoming}
+
+def parse_short_earnings_date(earn_str):
+    if not earn_str or earn_str == "â€”" or earn_str == "-":
+        return None
+    try:
+        parsed = datetime.strptime(f"{earn_str} {datetime.now().year}", "%b %d %Y").date()
+        if parsed < datetime.now().date() - timedelta(days=180):
+            parsed = parsed.replace(year=parsed.year + 1)
+        return parsed
+    except Exception:
+        return None
 
 def fetch_earnings_date(symbol):
     """
@@ -499,6 +588,7 @@ def fetch_quotes_schwab(symbols):
                 "price":  q.get("lastPrice", 0),
                 "change": q.get("netChange", 0),
                 "pct":    q.get("netPercentChangeInDouble", 0),
+                "volume": q.get("totalVolume", 0) or q.get("regularMarketVolume", 0) or 0,
             }
     return result
 
@@ -531,6 +621,31 @@ def fetch_history_schwab(symbol):
     set_schwab_error(f"Schwab history failed for {symbol} ({r.status_code}).", level="error")
     return []
 
+def fetch_history_series_schwab(symbol):
+    logger.info("fetch_history_series_schwab: requesting history for %s", symbol)
+    token = get_token()
+    if not token:
+        return []
+    verify = get_requests_verify_setting()
+    try:
+        r = requests.get("https://api.schwabapi.com/marketdata/v1/pricehistory",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"symbol": symbol, "periodType": "year", "period": 1,
+                    "frequencyType": "daily", "frequency": 1}, timeout=10, verify=verify)
+        if r.status_code != 200:
+            return []
+        series = []
+        for candle in r.json().get("candles", []):
+            stamp = candle.get("datetime")
+            close = candle.get("close")
+            if stamp is None or close is None:
+                continue
+            dt = datetime.fromtimestamp(stamp / 1000).date()
+            series.append({"date": dt, "close": round(float(close), 2)})
+        return series
+    except Exception:
+        return []
+
 # ─────────────────────────────────────────
 #  UNIFIED DATA FETCHER — auto picks source
 # ─────────────────────────────────────────
@@ -543,6 +658,13 @@ def fetch_history(symbol):
     if DATA_SOURCE == "schwab":
         return fetch_history_schwab(symbol)
     return fetch_history_yahoo(symbol)
+
+def fetch_history_series(symbol, period="2y"):
+    if DATA_SOURCE == "schwab":
+        series = fetch_history_series_schwab(symbol)
+        if series:
+            return series
+    return fetch_history_series_yahoo(symbol, period=period)
 
 def is_demo_mode():
     """Only true if Yahoo fails AND no Schwab key"""
@@ -1017,6 +1139,31 @@ SPMO_MOMENTUM_UNIVERSE = [
 SCAN_UNIVERSE = SPMO_MOMENTUM_UNIVERSE
 ETF_SYMBOLS = {"SPY", "QQQ", "SPMO"}
 
+AI_THEMES = {
+    "Power & Grid": {
+        "color": "#ffd740",
+        "tickers": ["CEG", "VST", "ETN", "NRG", "EQIX"],
+        "note": "Data center energy & infrastructure demand",
+    },
+    "Chips & Hardware": {
+        "color": "#7c6fff",
+        "tickers": ["MRVL", "ARM", "TSM", "ASML", "QCOM"],
+        "note": "Next-gen silicon & AI accelerators",
+    },
+    "AI Software": {
+        "color": "#00c896",
+        "tickers": ["PLTR", "SNOW", "NET", "DDOG", "MDB"],
+        "note": "AI-native enterprise software",
+    },
+    "Robotics": {
+        "color": "#4dd0e1",
+        "tickers": ["ISRG", "TER", "ROK", "ABB", "HON"],
+        "note": "Physical AI, automation & industrial robots",
+    },
+}
+
+AI_THEME_TICKERS = [t for s in AI_THEMES.values() for t in s["tickers"]]
+
 def _rebalance_period_key(today=None):
     """Return a cache key for daily or weekly momentum refreshes."""
     today = today or date.today()
@@ -1141,6 +1288,16 @@ def next_friday(start_date=None):
         days_ahead = 7
     return start_date + timedelta(days=days_ahead)
 
+def next_covered_call_expiry(start_date=None):
+    return next_friday(start_date)
+
+def covered_call_dte(start_date=None):
+    start_date = start_date or date.today()
+    return max((next_covered_call_expiry(start_date) - start_date).days, 1)
+
+def covered_call_expiry_label(start_date=None):
+    return next_covered_call_expiry(start_date).strftime("%b %d")
+
 def next_dte_expiry(days=14, start_date=None):
     start_date = start_date or date.today()
     return start_date + timedelta(days=days)
@@ -1231,6 +1388,33 @@ def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_dat
     bull_put = max(0, min(100, bull_put))
     bear = max(0, min(100, bear))
 
+    # ── Covered Call ──
+    cc = 50
+    if above_50:          cc += 12
+    if above_200:         cc += 8
+    if 40 <= rsi <= 65:   cc += 10
+    elif rsi > 65:        cc -= 12   # overbought = high assignment risk
+    if iv > 0.30:         cc += 15   # rich premium
+    elif iv > 0.22:       cc += 8
+    if 0 < mom5 < 6:      cc += 8    # mild upward, not runaway
+    if mom5 > 8:          cc -= 10   # capping a rocket costs too much
+    if change_pct > 0:    cc += 4
+    cc = max(0, min(100, cc))
+
+    # ── Long Put ──
+    lp = 50
+    if rsi > 65:          lp += 15
+    elif rsi > 55:        lp += 8
+    if not above_20:      lp += 10
+    if not above_50:      lp += 10
+    if not above_200:     lp += 8
+    if mom5 < -2:         lp += 10
+    if change_pct < 0:    lp += 5
+    if iv < 0.30:         lp += 8    # cheaper puts when IV is low
+    if rsi < 35:          lp -= 20
+    if above_50:          lp -= 10
+    lp = max(0, min(100, lp))
+
     # Spread suggestions (ATR-based width)
     width = max(round(atr * 1.5 / 5) * 5, 5)
     strike_step = strike_step_for_price(price)
@@ -1268,6 +1452,21 @@ def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_dat
     bear_break_even = round(bear_buy - bear_debit, 2)
     bear_wrong_way = probability_above_strike(price, bear_break_even, time_to_expiry, iv)
 
+    # Covered Call strikes
+    cc_strike  = round_to_strike(price * 1.05, strike_step)   # ~5% OTM call
+    cc_premium = round(max(bs_call(price, cc_strike, time_to_expiry, iv), 0.05), 2)
+    cc_yield_pct  = round(cc_premium / price * 100, 2)
+    cc_annualized = round(cc_yield_pct * (365 / dte), 1)       # annualised %
+    cc_break_even = round(price - cc_premium, 2)               # downside to break-even
+    cc_wrong_way  = probability_below_strike(price, cc_break_even, time_to_expiry, iv)
+
+    # Long Put strikes
+    lp_strike = round_to_strike(price * 0.97, strike_step)    # ~3% OTM put
+    lp_debit  = round(max(bs_put(price, lp_strike, time_to_expiry, iv), 0.05), 2)
+    lp_break_even = round(lp_strike - lp_debit, 2)
+    lp_rr = round(lp_break_even / lp_debit, 1) if lp_debit > 0 else 0
+    lp_wrong_way  = probability_above_strike(price, lp_strike, time_to_expiry, iv)
+
     return {
         "ticker": ticker, "price": price, "rsi": rsi,
         "ma50": ma50, "ma200": ma200, "iv": iv, "atr": atr,
@@ -1283,6 +1482,11 @@ def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_dat
         "bear_buy": bear_buy, "bear_sell": bear_sell,
         "bear_debit": bear_debit, "bear_profit": bear_max_profit, "bear_rr": bear_rr,
         "bear_break_even": bear_break_even, "bear_wrong_way": bear_wrong_way,
+        "cc_score": cc, "cc_strike": cc_strike, "cc_premium": cc_premium,
+        "cc_yield_pct": cc_yield_pct, "cc_annualized": cc_annualized,
+        "cc_break_even": cc_break_even, "cc_wrong_way": cc_wrong_way,
+        "lp_score": lp, "lp_strike": lp_strike, "lp_debit": lp_debit,
+        "lp_break_even": lp_break_even, "lp_rr": lp_rr, "lp_wrong_way": lp_wrong_way,
         "width": width, "expiry_date": expiry_date.strftime("%Y-%m-%d"), "dte": dte,
     }
 
@@ -1296,6 +1500,7 @@ def fetch_scan_data(ticker, period="1y"):
         price = float(h["Close"].iloc[-1])
         prev  = float(h["Close"].iloc[-2])
         return {
+            "dates":      [idx.to_pydatetime().date() if hasattr(idx, "to_pydatetime") else idx.date() for idx in h.index.tolist()],
             "closes":     [float(x) for x in h["Close"].tolist()],
             "highs":      [float(x) for x in h["High"].tolist()],
             "lows":       [float(x) for x in h["Low"].tolist()],
@@ -1329,6 +1534,7 @@ def backtest_strategy(ticker, strategy, period="1y", shares=100):
     closes = data["closes"]
     highs = data["highs"]
     lows = data["lows"]
+    dates = data["dates"]
     trade_rows = []
     equity = [0.0]
     running_pnl = 0.0
@@ -1337,6 +1543,8 @@ def backtest_strategy(ticker, strategy, period="1y", shares=100):
     for start in range(20, len(closes) - 6, 5):
         entry_price = closes[start]
         exit_price = closes[start + 5]
+        entry_date = dates[start]
+        exit_date = dates[start + 5]
         atr_window_high = highs[max(0, start - 14):start + 1]
         atr_window_low = lows[max(0, start - 14):start + 1]
         atr_window_close = closes[max(0, start - 14):start + 1]
@@ -1385,6 +1593,8 @@ def backtest_strategy(ticker, strategy, period="1y", shares=100):
         running_pnl += trade_pnl
         equity.append(running_pnl)
         trade_rows.append({
+            "entry_date": entry_date,
+            "exit_date": exit_date,
             "entry_price": entry_price,
             "exit_price": exit_price,
             "label": label,
@@ -1400,6 +1610,8 @@ def backtest_strategy(ticker, strategy, period="1y", shares=100):
     wins = sum(1 for row in trade_rows if row["win"])
     avg_return = sum(row["return_pct"] for row in trade_rows) / len(trade_rows)
     total_pnl = sum(row["pnl"] for row in trade_rows)
+    first_trade = trade_rows[0]["entry_date"]
+    last_trade = trade_rows[-1]["exit_date"]
     return {
         "ticker": ticker,
         "strategy": strategy,
@@ -1409,6 +1621,8 @@ def backtest_strategy(ticker, strategy, period="1y", shares=100):
         "avg_return": avg_return,
         "total_pnl": total_pnl,
         "max_drawdown": calc_max_drawdown(equity),
+        "first_trade": first_trade,
+        "last_trade": last_trade,
     }
 
 # ─────────────────────────────────────────
@@ -1448,10 +1662,13 @@ class TradingApp(tk.Tk):
         # State
         self.stock_data   = {}
         self.history_data = {}
+        self.history_series_data = {}
+        self.earnings_timeline_data = {}
         self.pnl_log      = []
         self.last_update  = "Never"
         self.is_running   = True
         self.selected_ticker = tk.StringVar(value="GOOGL")
+        self.detail_earnings_range = tk.StringVar(value="1Y")
 
         self._setup_fonts()
         self._setup_styles()
@@ -1530,9 +1747,11 @@ class TradingApp(tk.Tk):
         tab_income  = tk.Frame(nb, bg=BG)
         tab_backtest= tk.Frame(nb, bg=BG)
         tab_patterns= tk.Frame(nb, bg=BG)
+        tab_movers  = tk.Frame(nb, bg=BG)
         tab_spmo    = tk.Frame(nb, bg=BG)
         tab_scanner = tk.Frame(nb, bg=BG)
         tab_alerts  = tk.Frame(nb, bg=BG)
+        tab_ai      = tk.Frame(nb, bg=BG)
         tab_setup   = tk.Frame(nb, bg=BG)
 
         nb.add(tab_dash,    text="  Dashboard  ")
@@ -1540,9 +1759,11 @@ class TradingApp(tk.Tk):
         nb.add(tab_income,  text="  Income Tracker  ")
         nb.add(tab_backtest,text="  Backtester  ")
         nb.add(tab_patterns,text="  Pattern Detector  ")
+        nb.add(tab_movers,  text="  Movers  ")
         nb.add(tab_spmo,    text="  SPMO Strategy  ")
         nb.add(tab_scanner, text="  📡 Spread Scanner  ")
         nb.add(tab_alerts,  text="  Alerts  ")
+        nb.add(tab_ai,      text="  🤖 AI Themes  ")
         nb.add(tab_setup,   text="  Setup  ")
 
         self._build_dashboard(tab_dash)
@@ -1550,9 +1771,11 @@ class TradingApp(tk.Tk):
         self._build_income(tab_income)
         self._build_backtester(tab_backtest)
         self._build_patterns(tab_patterns)
+        self._build_movers(tab_movers)
         self._build_spmo(tab_spmo)
         self._build_scanner(tab_scanner)
         self._build_alerts(tab_alerts)
+        self._build_ai_themes(tab_ai)
         self._build_setup(tab_setup)
 
         # Clock tick
@@ -1596,7 +1819,6 @@ class TradingApp(tk.Tk):
             card.grid(row=0, column=i, padx=4, sticky="nsew")
             etf_row.columnconfigure(i, weight=1)
             self.etf_cards[ticker] = card
-
         # Right panel — detail + summary
         right = tk.Frame(parent, bg=BG)
         right.pack(side="left", fill="both", expand=True, padx=(6,12), pady=12)
@@ -1701,6 +1923,250 @@ class TradingApp(tk.Tk):
         f._refs = {"price": lbl_price, "change": lbl_chg, "signal": lbl_sig}
         return f
 
+    def _make_earnings_reaction_card(self, parent, ticker):
+        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x", padx=10, pady=(8,2))
+        tk.Label(head, text=ticker, font=self.f_mono, bg=CARD, fg=TEXT).pack(side="left")
+        lbl_stats = tk.Label(head, text="Loading earnings history...", font=self.f_small, bg=CARD, fg=TEXT3)
+        lbl_stats.pack(side="right")
+
+        canvas = tk.Canvas(card, height=110, bg=BG2, highlightthickness=0)
+        canvas.pack(fill="x", padx=10, pady=(0,4))
+
+        lbl_info = tk.Label(card, text="Waiting for history...", font=self.f_small, bg=CARD, fg=TEXT2, justify="left")
+        lbl_info.pack(anchor="w", padx=10, pady=(0,8))
+        card._refs = {"canvas": canvas, "stats": lbl_stats, "info": lbl_info}
+        return card
+
+    def _compute_earnings_reactions(self, ticker):
+        series = self.history_series_data.get(ticker, [])
+        timeline = self.earnings_timeline_data.get(ticker, {"historical": [], "upcoming": None})
+        if len(series) < 10:
+            return {"historical": [], "upcoming": timeline.get("upcoming"), "series": series}
+
+        dates = [pt["date"] for pt in series]
+        closes = [pt["close"] for pt in series]
+        reactions = []
+        for event_date in timeline.get("historical", []):
+            idx = next((i for i, d in enumerate(dates) if d >= event_date), None)
+            if idx is None or idx < 1 or idx >= len(closes) - 1:
+                continue
+            pre_close = closes[idx - 1]
+            day1_close = closes[min(idx + 1, len(closes) - 1)]
+            day3_close = closes[min(idx + 3, len(closes) - 1)]
+            if not pre_close:
+                continue
+            day1_pct = ((day1_close - pre_close) / pre_close) * 100
+            day3_pct = ((day3_close - pre_close) / pre_close) * 100
+            reactions.append({
+                "date": dates[idx],
+                "index": idx,
+                "day1_pct": round(day1_pct, 2),
+                "day3_pct": round(day3_pct, 2),
+            })
+        return {"historical": reactions, "upcoming": timeline.get("upcoming"), "series": series}
+
+    def _filter_series_for_range(self, series, years_label):
+        if not series:
+            return []
+        if years_label == "2Y":
+            return series
+        end_date = series[-1]["date"]
+        start_cutoff = end_date - timedelta(days=365)
+        filtered = [pt for pt in series if pt["date"] >= start_cutoff]
+        return filtered or series
+
+    def _draw_earnings_mini_chart(self, ticker, canvas, stats_lbl, info_lbl):
+        if not canvas or not stats_lbl or not info_lbl:
+            return
+        canvas.update_idletasks()
+        w = max(canvas.winfo_width(), 280)
+        h = max(canvas.winfo_height(), 110)
+        canvas.delete("all")
+
+        reaction_data = self._compute_earnings_reactions(ticker)
+        series = reaction_data["series"]
+        if len(series) < 10:
+            stats_lbl.config(text="Need more history", fg=TEXT3)
+            info_lbl.config(text="Price history is still loading for this symbol.", fg=TEXT3)
+            return
+
+        closes = [pt["close"] for pt in series]
+        min_p = min(closes)
+        max_p = max(closes)
+        pad = max((max_p - min_p) * 0.08, 1)
+        min_p -= pad
+        max_p += pad
+        x_pad = 8
+        y_pad = 10
+        usable_w = max(w - x_pad * 2, 10)
+        usable_h = max(h - y_pad * 2, 10)
+
+        def x_for_idx(idx):
+            denom = max(len(series) - 1, 1)
+            return x_pad + (idx / denom) * usable_w
+
+        def y_for_price(price):
+            span = max(max_p - min_p, 1)
+            return y_pad + (max_p - price) / span * usable_h
+
+        points = []
+        for idx, pt in enumerate(series):
+            points.extend([x_for_idx(idx), y_for_price(pt["close"])])
+        cfg = PORTFOLIO.get(ticker, {})
+        canvas.create_line(*points, fill=cfg.get("color", ACCENT), width=2, smooth=True)
+
+        hist_events = reaction_data["historical"][-5:]
+        for event in hist_events:
+            x = x_for_idx(event["index"])
+            drop = event["day3_pct"] < 0
+            line_color = RED if drop else GREEN
+            canvas.create_line(x, y_pad, x, h - y_pad, fill=line_color, dash=(3, 4))
+            canvas.create_text(
+                min(x + 18, w - 24),
+                y_pad + 10,
+                text=f"{event['day3_pct']:+.1f}%",
+                fill=line_color,
+                font=("Segoe UI", 7, "bold")
+            )
+
+        upcoming = reaction_data["upcoming"]
+        if upcoming:
+            last_date = series[-1]["date"]
+            days_forward = (upcoming - last_date).days
+            if days_forward >= 0:
+                projected_idx = (len(series) - 1) + max(days_forward, 1)
+                future_x = min(x_pad + (projected_idx / max(len(series) + 10, 1)) * usable_w, w - x_pad)
+                canvas.create_line(future_x, y_pad, future_x, h - y_pad, fill=YELLOW, dash=(2, 2))
+                canvas.create_text(
+                    future_x,
+                    h - 8,
+                    text=upcoming.strftime("%b %d"),
+                    fill=YELLOW,
+                    font=("Segoe UI", 7, "bold")
+                )
+
+        worst_drop = min((e["day3_pct"] for e in hist_events), default=None)
+        avg_move = None
+        if hist_events:
+            avg_move = sum(e["day3_pct"] for e in hist_events) / len(hist_events)
+
+        stats_parts = []
+        if worst_drop is not None:
+            stats_parts.append(f"Worst 3D: {worst_drop:+.1f}%")
+        if avg_move is not None:
+            stats_parts.append(f"Avg 3D: {avg_move:+.1f}%")
+        stats_lbl.config(
+            text="   |   ".join(stats_parts) if stats_parts else "No past earnings reactions",
+            fg=RED if worst_drop is not None and worst_drop < -3 else TEXT2
+        )
+
+        current_text = upcoming.strftime("%b %d") if upcoming else "—"
+        hist_text = ", ".join(e["date"].strftime("%b %d") for e in hist_events[-3:]) if hist_events else "None"
+        info_lbl.config(
+            text=f"Current ER: {current_text}   |   Recent ERs: {hist_text}",
+            fg=TEXT2
+        )
+
+    def _render_earnings_dashboard(self):
+        return
+
+    def _draw_detail_earnings_chart(self, ticker):
+        if not hasattr(self, "detail_earnings_plot_frame"):
+            return
+        if self.detail_earnings_canvas_widget is not None:
+            self.detail_earnings_canvas_widget.get_tk_widget().destroy()
+            self.detail_earnings_canvas_widget = None
+
+        range_label = self.detail_earnings_range.get() if hasattr(self, "detail_earnings_range") else "1Y"
+        reaction_data = self._compute_earnings_reactions(ticker)
+        full_series = reaction_data["series"]
+        series = self._filter_series_for_range(full_series, range_label)
+        if len(series) < 10:
+            self.detail_earnings_stats.config(text="History still loading", fg=TEXT3)
+            self.detail_earnings_info.config(text="Not enough price history yet to draw the earnings chart.", fg=TEXT3)
+            return
+
+        series_dates = {pt["date"] for pt in series}
+        hist_events = [e for e in reaction_data["historical"] if e["date"] in series_dates]
+        dates = [pt["date"] for pt in series]
+        closes = [pt["close"] for pt in series]
+        color = PORTFOLIO.get(ticker, {}).get("color", ACCENT)
+
+        if not MATPLOTLIB_OK:
+            self.detail_earnings_stats.config(text="matplotlib not installed", fg=RED)
+            self.detail_earnings_info.config(text="Install matplotlib to view the earnings chart.", fg=TEXT3)
+            return
+
+        fig = Figure(figsize=(8.6, 3.2), facecolor=BG2)
+        fig.subplots_adjust(left=0.08, right=0.98, top=0.9, bottom=0.2)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(BG2)
+        ax.plot(dates, closes, color=color, linewidth=1.8)
+        ax.fill_between(dates, closes, min(closes) * 0.98, color=color, alpha=0.08)
+
+        x_min = min(dates)
+        x_max = max(dates)
+        right_pad_days = 14 if range_label == "1Y" else 21
+        ax.set_xlim(x_min, x_max + timedelta(days=right_pad_days))
+
+        for event in hist_events:
+            line_color = RED if event["day3_pct"] < 0 else GREEN
+            ax.axvline(event["date"], color=line_color, linestyle="--", linewidth=1.2, alpha=0.9, zorder=5)
+            nearest_close = closes[min(range(len(dates)), key=lambda i: abs((dates[i] - event["date"]).days))]
+            ax.annotate(
+                f"{event['day3_pct']:+.1f}%",
+                xy=(event["date"], nearest_close),
+                xytext=(4, 8),
+                textcoords="offset points",
+                color=line_color,
+                fontsize=8,
+                fontweight="bold"
+            )
+
+        upcoming = reaction_data["upcoming"]
+        if not upcoming:
+            upcoming = parse_short_earnings_date(get_earnings(ticker))
+        if upcoming:
+            ax.axvline(upcoming, color=YELLOW, linestyle="-", linewidth=2.2, alpha=0.95, zorder=6)
+            ax.text(upcoming, ax.get_ylim()[1], f" Next ER {upcoming.strftime('%b %d')}",
+                    color=YELLOW, fontsize=8, va="top", ha="left")
+
+        ax.grid(axis="y", color=BORDER, linestyle="--", linewidth=0.6, alpha=0.6)
+        ax.spines[:].set_color(BORDER)
+        ax.tick_params(axis="x", colors=TEXT3, labelsize=8)
+        ax.tick_params(axis="y", colors=TEXT3, labelsize=8)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1 if range_label == "1Y" else 2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        fig.autofmt_xdate(rotation=0, ha="center")
+        ax.set_title(f"{ticker} {range_label} Price History With Earnings", color=TEXT, fontsize=10, loc="left", pad=8)
+
+        self.detail_earnings_canvas_widget = FigureCanvasTkAgg(fig, master=self.detail_earnings_plot_frame)
+        self.detail_earnings_canvas_widget.draw()
+        self.detail_earnings_canvas_widget.get_tk_widget().pack(fill="both", expand=True)
+
+        worst_drop = min((e["day3_pct"] for e in hist_events), default=None)
+        avg_drop = (sum(e["day3_pct"] for e in hist_events) / len(hist_events)) if hist_events else None
+        stats = []
+        if worst_drop is not None:
+            stats.append(f"Worst 3D after ER: {worst_drop:+.1f}%")
+        if avg_drop is not None:
+            stats.append(f"Avg 3D after ER: {avg_drop:+.1f}%")
+        stats.insert(0, f"Range: {range_label}")
+        self.detail_earnings_stats.config(
+            text="   |   ".join(stats) if stats else "No historical earnings reactions found",
+            fg=RED if worst_drop is not None and worst_drop < -3 else TEXT2
+        )
+
+        recent_hist = ", ".join(e["date"].strftime("%b %d") for e in hist_events[-4:]) if hist_events else "None"
+        upcoming_text = upcoming.strftime("%b %d") if upcoming else "—"
+        self.detail_earnings_info.config(
+            text=f"Current ER: {upcoming_text}   |   Historical ERs: {recent_hist}",
+            fg=TEXT2
+        )
+
     def _build_detail_panel(self, parent):
         tk.Label(parent, text="POSITION DETAIL",
                  font=self.f_small, bg=CARD, fg=TEXT3).pack(anchor="w", padx=14, pady=(12,0))
@@ -1733,14 +2199,65 @@ class TradingApp(tk.Tk):
             lbl.pack(anchor="w")
             self.detail_labels[k] = lbl
 
+        chart_sep = tk.Frame(parent, bg=BORDER, height=1)
+        chart_sep.pack(fill="x", padx=14, pady=8)
+
+        chart_wrap = tk.Frame(parent, bg=CARD, padx=14, pady=4)
+        chart_wrap.pack(fill="both", expand=True)
+        self.detail_earnings_title = tk.Label(
+            chart_wrap,
+            text="1Y PRICE HISTORY WITH EARNINGS",
+            font=self.f_small,
+            bg=CARD,
+            fg=TEXT3
+        )
+        self.detail_earnings_title.pack(anchor="w", pady=(0,6))
+        range_row = tk.Frame(chart_wrap, bg=CARD)
+        range_row.pack(fill="x", pady=(0,4))
+        tk.Label(range_row, text="Range:", font=self.f_small, bg=CARD, fg=TEXT3).pack(side="left")
+        for label in ("1Y", "2Y"):
+            tk.Radiobutton(
+                range_row,
+                text=label,
+                value=label,
+                variable=self.detail_earnings_range,
+                command=lambda: self._draw_detail_earnings_chart(self.selected_ticker.get()),
+                bg=CARD,
+                fg=TEXT2,
+                selectcolor=ACCENT,
+                activebackground=CARD,
+                activeforeground=TEXT,
+                font=self.f_small,
+                relief="flat",
+                cursor="hand2"
+            ).pack(side="left", padx=(8, 0))
+        self.detail_earnings_stats = tk.Label(
+            chart_wrap, text="", font=self.f_small, bg=CARD, fg=TEXT2
+        )
+        self.detail_earnings_stats.pack(anchor="w")
+        self.detail_earnings_plot_frame = tk.Frame(chart_wrap, bg=BG2, height=260)
+        self.detail_earnings_plot_frame.pack(fill="both", expand=True, pady=(6,4))
+        self.detail_earnings_plot_frame.pack_propagate(False)
+        self.detail_earnings_canvas_widget = None
+        self.detail_earnings_info = tk.Label(
+            chart_wrap, text="", font=self.f_small, bg=CARD, fg=TEXT2, justify="left"
+        )
+        self.detail_earnings_info.pack(anchor="w", pady=(0,6))
+
         # Covered call action row
         sep2 = tk.Frame(parent, bg=BORDER, height=1)
         sep2.pack(fill="x", padx=14, pady=8)
 
         action = tk.Frame(parent, bg=CARD, padx=14)
         action.pack(fill="x")
-        tk.Label(action, text="COVERED CALL — Apr 25 Expiry",
-                 font=self.f_small, bg=CARD, fg=TEXT3).pack(anchor="w", pady=(0,6))
+        self.detail_call_title = tk.Label(
+            action,
+            text=f"COVERED CALL - {covered_call_expiry_label()} Expiry",
+            font=self.f_small,
+            bg=CARD,
+            fg=TEXT3
+        )
+        self.detail_call_title.pack(anchor="w", pady=(0,6))
 
         self.detail_call = tk.Label(action, text="", font=self.f_head, bg=CARD, fg=ACCENT2)
         self.detail_call.pack(anchor="w")
@@ -1782,6 +2299,7 @@ class TradingApp(tk.Tk):
             return
 
         history = self.history_data.get(ticker, [])
+        series = self.history_series_data.get(ticker, [])
         if len(history) < 5:
             # Demo price history
             import random
@@ -1791,9 +2309,15 @@ class TradingApp(tk.Tk):
             for i in range(1, len(history)):
                 history[i] = history[i-1] * (1 + random.gauss(0.0002, 0.012))
 
-        n   = len(history)
-        xs  = list(range(n))
-        ma50_vals  = [calc_ma(history[:i+1], 50) or history[i] for i in range(n)]
+        n = len(history)
+        if series:
+            dates = [item.get("date") for item in series[:n]]
+            if len(dates) < n:
+                dates += [None] * (n - len(dates))
+        else:
+            dates = [None] * n
+        xs = list(range(n))
+        ma50_vals = [calc_ma(history[:i+1], 50) or history[i] for i in range(n)]
         ma200_vals = [calc_ma(history[:i+1], 200) or history[i] for i in range(n)]
 
         fig = Figure(figsize=(8, 4.5), facecolor=BG)
@@ -1815,6 +2339,60 @@ class TradingApp(tk.Tk):
         ax1.plot(xs, ma50_vals,  color=ACCENT2, linewidth=1, alpha=0.7, linestyle="--", label="MA50")
         ax1.plot(xs, ma200_vals, color=YELLOW,  linewidth=1, alpha=0.7, linestyle=":",  label="MA200")
         ax1.fill_between(xs, history, min(history)*0.98, alpha=0.08, color=color)
+
+        # Hover tooltip for price points
+        annot = ax1.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            fontsize=8,
+            color=TEXT,
+            bbox={"boxstyle": "round,pad=0.3", "fc": BG3, "ec": TEXT3, "alpha": 0.95},
+            arrowprops={"arrowstyle": "->", "color": TEXT},
+        )
+        annot.set_visible(False)
+
+        tooltip_lbl = tk.Label(
+            self.chart_frame,
+            text="",
+            font=self.f_body,
+            bg=BG3,
+            fg=TEXT,
+            bd=1,
+            relief="solid",
+            justify="left",
+        )
+        tooltip_lbl.place_forget()
+
+        def update_annot(ind):
+            x = ind
+            price = history[x]
+            date_label = dates[x].strftime("%b %d, %Y") if dates[x] else f"Day {x + 1}"
+            annot.xy = (x, price)
+            annot.set_text(f"{date_label}\n${price:.2f}")
+            tooltip_lbl.config(text=f"{date_label}\n${price:.2f}")
+
+        def on_motion(event):
+            if event.inaxes != ax1 or event.xdata is None:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                tooltip_lbl.place_forget()
+                return
+
+            nearest = min(range(n), key=lambda i: abs(i - event.xdata))
+            if abs(nearest - event.xdata) <= 0.5:
+                update_annot(nearest)
+                annot.set_visible(True)
+                tooltip_lbl.place(x=event.x + 12, y=event.y + 12)
+                tooltip_lbl.lift()
+                canvas.draw_idle()
+            else:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    canvas.draw_idle()
+                tooltip_lbl.place_forget()
 
         # Strike line
         if cfg.get("call_strike"):
@@ -1846,6 +2424,7 @@ class TradingApp(tk.Tk):
 
         canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
         canvas.draw()
+        fig.canvas.mpl_connect("motion_notify_event", on_motion)
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _update_chart(self):
@@ -1933,6 +2512,18 @@ class TradingApp(tk.Tk):
         )
         self.backtest_status.pack(side="left", padx=16)
 
+        explainer = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        explainer.pack(fill="x", padx=12, pady=(0, 8))
+        self.backtest_explainer = tk.Label(
+            explainer,
+            text=(
+                "This estimates what repeated weekly trades would have looked like over the chosen period. "
+                "It uses modeled option pricing, so treat it as a comparison tool, not exact historical fills."
+            ),
+            font=self.f_small, bg=CARD, fg=TEXT2, wraplength=1050, justify="left"
+        )
+        self.backtest_explainer.pack(anchor="w", padx=12, pady=(10, 10))
+
         controls = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
         controls.pack(fill="x", padx=12, pady=(0, 8))
         inner = tk.Frame(controls, bg=BG2, padx=12, pady=10)
@@ -1960,7 +2551,7 @@ class TradingApp(tk.Tk):
         summary = tk.Frame(parent, bg=BG)
         summary.pack(fill="x", padx=12, pady=(0, 8))
         self.backtest_cards = {}
-        for title in ["TOTAL P/L", "WIN RATE", "AVG RETURN", "MAX DD"]:
+        for title in ["EST. TOTAL P/L", "WIN RATE", "AVG TRADE RETURN", "MAX DRAWDOWN"]:
             card = tk.Frame(summary, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
             card.pack(side="left", fill="x", expand=True, padx=4)
             tk.Label(card, text=title, font=self.f_small, bg=CARD, fg=TEXT3).pack(anchor="w", padx=12, pady=(10, 2))
@@ -1972,7 +2563,7 @@ class TradingApp(tk.Tk):
         table_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         hdr = tk.Frame(table_wrap, bg=BG3)
         hdr.pack(fill="x")
-        headers = [("TRADE", 8), ("SETUP", 18), ("ENTRY", 10), ("EXIT", 10), ("P/L", 10), ("RETURN", 10), ("RESULT", 10)]
+        headers = [("TRADE", 6), ("DATES", 22), ("SETUP", 18), ("ENTRY/EXIT", 18), ("P/L", 10), ("RETURN", 10), ("RESULT", 10)]
         for h, w in headers:
             tk.Label(hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
                      width=w, anchor="w").pack(side="left", padx=5, pady=6)
@@ -2002,19 +2593,31 @@ class TradingApp(tk.Tk):
             self.backtest_status.config(text="Backtest failed. Check ticker/data availability.", fg=RED)
             for val in self.backtest_cards.values():
                 val.config(text="?", fg=TEXT)
+            self.backtest_explainer.config(
+                text="No results were generated. Try a liquid ticker and a longer lookback like 1Y or 2Y.",
+                fg=TEXT3
+            )
             tk.Label(self.backtest_table, text="No backtest results available.",
                      font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
             return
 
         r = self.backtest_results
         self.backtest_status.config(
-            text=f"{r['ticker']} {r['strategy']} backtest complete ? {r['trade_count']} trades",
+            text=f"{r['ticker']} {r['strategy']} backtest complete - {r['trade_count']} simulated trades",
             fg=GREEN
         )
-        self.backtest_cards["TOTAL P/L"].config(text=f"${r['total_pnl']:,.0f}", fg=GREEN if r["total_pnl"] >= 0 else RED)
+        self.backtest_explainer.config(
+            text=(
+                f"Showing estimated {r['strategy']} trades for {r['ticker']} from "
+                f"{r['first_trade'].strftime('%b %d, %Y')} to {r['last_trade'].strftime('%b %d, %Y')}. "
+                "Each row is one simulated weekly trade: entry date, exit date, setup used, dollars made or lost, and percent return."
+            ),
+            fg=TEXT2
+        )
+        self.backtest_cards["EST. TOTAL P/L"].config(text=f"${r['total_pnl']:,.0f}", fg=GREEN if r["total_pnl"] >= 0 else RED)
         self.backtest_cards["WIN RATE"].config(text=f"{r['win_rate'] * 100:.1f}%", fg=TEXT)
-        self.backtest_cards["AVG RETURN"].config(text=f"{r['avg_return']:.2f}%", fg=TEXT)
-        self.backtest_cards["MAX DD"].config(text=f"{r['max_drawdown'] * 100:.1f}%", fg=RED if r["max_drawdown"] > 0.15 else YELLOW)
+        self.backtest_cards["AVG TRADE RETURN"].config(text=f"{r['avg_return']:.2f}%", fg=TEXT)
+        self.backtest_cards["MAX DRAWDOWN"].config(text=f"{r['max_drawdown'] * 100:.1f}%", fg=RED if r["max_drawdown"] > 0.15 else YELLOW)
 
         for idx, row in enumerate(r["trades"], start=1):
             bg_c = CARD if idx % 2 else BG2
@@ -2022,14 +2625,14 @@ class TradingApp(tk.Tk):
             line.pack(fill="x", pady=1)
             vals = [
                 str(idx),
+                f"{row['entry_date']:%b %d} -> {row['exit_date']:%b %d}",
                 row["label"],
-                f"${row['entry_price']:.2f}",
-                f"${row['exit_price']:.2f}",
+                f"${row['entry_price']:.2f} -> ${row['exit_price']:.2f}",
                 f"${row['pnl']:.0f}",
                 f"{row['return_pct']:.2f}%",
-                "WIN" if row["win"] else "LOSS",
+                "WIN" if row["win"] else "LOSS" if not row["assigned"] else "ASSIGNED/LOSS",
             ]
-            widths = [8, 18, 10, 10, 10, 10, 10]
+            widths = [6, 22, 18, 18, 10, 10, 10]
             for i, (val, w) in enumerate(zip(vals, widths)):
                 fg = GREEN if i == 6 and row["win"] else RED if i == 6 else TEXT
                 tk.Label(line, text=val, font=self.f_mono_s, bg=bg_c, fg=fg,
@@ -2213,6 +2816,221 @@ class TradingApp(tk.Tk):
         self.pattern_collapsed[ticker] = not self.pattern_collapsed.get(ticker, False)
         self._render_pattern_results()
 
+    def _build_ai_themes(self, parent):
+        self.ai_sector_tables = {}
+
+        top = tk.Frame(parent, bg=BG)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        tk.Label(top, text="AI Next-Wave Themes", font=self.f_head, bg=BG, fg=TEXT).pack(side="left")
+        self.ai_status = tk.Label(top, text="Tracking 20 names across 4 AI themes.",
+                                  font=self.f_small, bg=BG, fg=TEXT2)
+        self.ai_status.pack(side="left", padx=16)
+
+        grid = tk.Frame(parent, bg=BG)
+        grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        for idx, (sector, cfg) in enumerate(AI_THEMES.items()):
+            row_i, col_i = divmod(idx, 2)
+            card = tk.Frame(grid, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+            card.grid(row=row_i, column=col_i, sticky="nsew", padx=4, pady=4)
+            grid.rowconfigure(row_i, weight=1)
+
+            head = tk.Frame(card, bg=BG3, padx=10, pady=6)
+            head.pack(fill="x")
+            dot = tk.Label(head, text="●", font=self.f_body, bg=BG3, fg=cfg["color"])
+            dot.pack(side="left")
+            tk.Label(head, text=f"  {sector}", font=self.f_head, bg=BG3, fg=TEXT).pack(side="left")
+            tk.Label(head, text=cfg["note"], font=self.f_small, bg=BG3, fg=TEXT2).pack(side="right")
+
+            hdr = tk.Frame(card, bg=BG2, padx=6, pady=4)
+            hdr.pack(fill="x")
+            for label, width, anchor in [
+                ("TICKER", 8, "w"), ("PRICE", 10, "e"), ("CHG%", 8, "e"),
+                ("RSI", 6, "e"), ("SIGNAL", 12, "w"),
+            ]:
+                tk.Label(hdr, text=label, font=self.f_small, bg=BG2, fg=TEXT3,
+                         width=width, anchor=anchor).pack(side="left", padx=4)
+
+            table = tk.Frame(card, bg=CARD)
+            table.pack(fill="both", expand=True)
+            self.ai_sector_tables[sector] = table
+
+            tk.Label(table, text="Loading...", font=self.f_small, bg=CARD, fg=TEXT3).pack(pady=16)
+
+    def _render_ai_themes(self):
+        if not hasattr(self, "ai_sector_tables"):
+            return
+        any_data = False
+        for sector, cfg in AI_THEMES.items():
+            table = self.ai_sector_tables[sector]
+            for w in table.winfo_children():
+                w.destroy()
+
+            for i, ticker in enumerate(cfg["tickers"]):
+                d = self.stock_data.get(ticker)
+                if not d or not d.get("price"):
+                    row = tk.Frame(table, bg=BG2 if i % 2 else CARD)
+                    row.pack(fill="x")
+                    tk.Label(row, text=ticker, font=self.f_mono_s, bg=row["bg"],
+                             fg=TEXT3, width=8, anchor="w").pack(side="left", padx=6, pady=6)
+                    tk.Label(row, text="—", font=self.f_mono_s, bg=row["bg"],
+                             fg=TEXT3).pack(side="left", padx=4)
+                    continue
+
+                any_data = True
+                price = d["price"]
+                pct   = d["pct"]
+                hist  = self.history_data.get(ticker, [])
+                rsi   = calc_rsi(hist) if hist else 50
+                ma50  = calc_ma(hist, 50)
+                ma200 = calc_ma(hist, 200)
+                sig, sig_color, _ = get_signal(price, rsi, ma50 or price, ma200 or price)
+
+                bg_c    = BG2 if i % 2 else CARD
+                chg_col = GREEN if pct >= 0 else RED
+                rsi_col = GREEN if rsi < 35 else RED if rsi > 65 else TEXT2
+
+                row = tk.Frame(table, bg=bg_c, cursor="hand2")
+                row.pack(fill="x")
+                row.bind("<Button-1>", lambda e, t=ticker: self._jump_to_mover_ticker(t))
+
+                vals = [
+                    (ticker,           8,  "w", TEXT,    self.f_mono_s),
+                    (f"${price:.2f}",  10, "e", TEXT,    self.f_mono_s),
+                    (f"{pct:+.2f}%",   8,  "e", chg_col, self.f_mono_s),
+                    (str(int(rsi)),    6,  "e", rsi_col, self.f_mono_s),
+                    (sig,              12, "w", sig_color, self.f_small),
+                ]
+                for text, width, anchor, fg, font in vals:
+                    lbl = tk.Label(row, text=text, font=font, bg=bg_c, fg=fg,
+                                   width=width, anchor=anchor)
+                    lbl.pack(side="left", padx=4, pady=6)
+                    lbl.bind("<Button-1>", lambda e, t=ticker: self._jump_to_mover_ticker(t))
+
+        if any_data:
+            self.ai_status.config(text=f"Tracking {len(AI_THEME_TICKERS)} names across {len(AI_THEMES)} AI themes.", fg=GREEN)
+
+    def _build_movers(self, parent):
+        self.movers_universe = sorted(set(list(PORTFOLIO.keys()) + list(ETF_SYMBOLS) + list(SCAN_UNIVERSE)))
+
+        top = tk.Frame(parent, bg=BG)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        tk.Label(top, text="Biggest Gainers & Losers",
+                 font=self.f_head, bg=BG, fg=TEXT).pack(side="left")
+        self.movers_status = tk.Label(
+            top,
+            text=f"Tracking {len(self.movers_universe)} names across portfolio, ETFs, and scan universe.",
+            font=self.f_small, bg=BG, fg=TEXT2
+        )
+        self.movers_status.pack(side="left", padx=16)
+
+        split = tk.Frame(parent, bg=BG)
+        split.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        gainers = tk.Frame(split, bg=BG)
+        gainers.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        tk.Label(gainers, text="BIGGEST GAINERS", font=self.f_head, bg=BG, fg=GREEN).pack(anchor="w", pady=(0, 6))
+        gain_hdr = tk.Frame(gainers, bg=BG3)
+        gain_hdr.pack(fill="x")
+        for h, w in [("TICKER", 9), ("PRICE", 9), ("CHANGE", 9), ("%", 8), ("TODAY VOL", 12)]:
+            tk.Label(gain_hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
+                     width=w, anchor="w").pack(side="left", padx=5, pady=6)
+        self.gainers_table = tk.Frame(gainers, bg=BG)
+        self.gainers_table.pack(fill="both", expand=True)
+
+        losers = tk.Frame(split, bg=BG)
+        losers.pack(side="left", fill="both", expand=True, padx=(4, 4))
+        tk.Label(losers, text="BIGGEST LOSERS", font=self.f_head, bg=BG, fg=RED).pack(anchor="w", pady=(0, 6))
+        loss_hdr = tk.Frame(losers, bg=BG3)
+        loss_hdr.pack(fill="x")
+        for h, w in [("TICKER", 9), ("PRICE", 9), ("CHANGE", 9), ("%", 8), ("TODAY VOL", 12)]:
+            tk.Label(loss_hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
+                     width=w, anchor="w").pack(side="left", padx=5, pady=6)
+        self.losers_table = tk.Frame(losers, bg=BG)
+        self.losers_table.pack(fill="both", expand=True)
+
+        volume = tk.Frame(split, bg=BG)
+        volume.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        tk.Label(volume, text="TOP VOLUME MOVERS", font=self.f_head, bg=BG, fg=ACCENT2).pack(anchor="w", pady=(0, 6))
+        vol_hdr = tk.Frame(volume, bg=BG3)
+        vol_hdr.pack(fill="x")
+        for h, w in [("TICKER", 9), ("PRICE", 9), ("CHANGE", 9), ("%", 8), ("TODAY VOL", 12)]:
+            tk.Label(vol_hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
+                     width=w, anchor="w").pack(side="left", padx=5, pady=6)
+        self.volume_table = tk.Frame(volume, bg=BG)
+        self.volume_table.pack(fill="both", expand=True)
+
+        tk.Label(self.gainers_table, text="Refreshing movers with market data...",
+                 font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+        tk.Label(self.losers_table, text="Refreshing movers with market data...",
+                 font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+        tk.Label(self.volume_table, text="Refreshing movers with market data...",
+                 font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+
+    def _render_movers(self):
+        if not hasattr(self, "gainers_table"):
+            return
+        for w in self.gainers_table.winfo_children():
+            w.destroy()
+        for w in self.losers_table.winfo_children():
+            w.destroy()
+        for w in self.volume_table.winfo_children():
+            w.destroy()
+
+        universe_data = []
+        for ticker in self.movers_universe:
+            d = self.stock_data.get(ticker)
+            if d and d.get("price"):
+                universe_data.append((ticker, d))
+
+        if not universe_data:
+            self.movers_status.config(text="No mover data available yet.", fg=RED)
+            tk.Label(self.gainers_table, text="No mover data available.",
+                     font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+            tk.Label(self.losers_table, text="No mover data available.",
+                     font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+            tk.Label(self.volume_table, text="No mover data available.",
+                     font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+            return
+
+        gainers = sorted(universe_data, key=lambda x: x[1].get("pct", 0), reverse=True)[:10]
+        losers = sorted(universe_data, key=lambda x: x[1].get("pct", 0))[:10]
+        top_volume = sorted(universe_data, key=lambda x: x[1].get("volume", 0), reverse=True)[:10]
+        self.movers_status.config(text=f"Showing movers from {len(universe_data)} tracked names.", fg=GREEN)
+
+        def render_rows(parent, rows, color):
+            for idx, (ticker, d) in enumerate(rows, start=1):
+                bg_c = CARD if idx % 2 else BG2
+                row = tk.Frame(parent, bg=bg_c, highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
+                row.pack(fill="x", pady=1)
+                vals = [
+                    ticker,
+                    f"${d.get('price', 0):.2f}",
+                    f"{d.get('change', 0):+.2f}",
+                    f"{d.get('pct', 0):+.2f}%",
+                    f"{int(d.get('volume', 0)):,}",
+                ]
+                widths = [9, 9, 9, 8, 12]
+                for i, (val, w) in enumerate(zip(vals, widths)):
+                    fg = color if i in (2, 3) else TEXT
+                    lbl = tk.Label(row, text=val, font=self.f_mono_s, bg=bg_c, fg=fg,
+                                   width=w, anchor="w")
+                    lbl.pack(side="left", padx=5, pady=8)
+                    lbl.bind("<Button-1>", lambda e, t=ticker: self._jump_to_mover_ticker(t))
+                row.bind("<Button-1>", lambda e, t=ticker: self._jump_to_mover_ticker(t))
+
+        render_rows(self.gainers_table, gainers, GREEN)
+        render_rows(self.losers_table, losers, RED)
+        render_rows(self.volume_table, top_volume, ACCENT2)
+
+    def _jump_to_mover_ticker(self, ticker):
+        self._select_ticker(ticker)
+        if hasattr(self, "chart_ticker_var"):
+            self.chart_ticker_var.set(ticker)
+            self._update_chart()
+
     def _build_spmo(self, parent):
         self.spmo_running = False
 
@@ -2365,6 +3183,9 @@ class TradingApp(tk.Tk):
     def _build_scanner(self, parent):
         self.scanner_results = []
         self.scanner_running = False
+        self.scanner_auto_refresh = tk.BooleanVar(value=False)
+        self.scanner_auto_interval = tk.IntVar(value=5)
+        self.last_scanner_run_ts = 0.0
 
         # ── Top bar ──
         top = tk.Frame(parent, bg=BG)
@@ -2415,6 +3236,14 @@ class TradingApp(tk.Tk):
                  bg=BG3, fg=TEXT, insertbackground=TEXT,
                  relief="flat").pack(side="left")
         tk.Label(fi, text="Fixed at 14 DTE", font=self.f_small, bg=BG2, fg=TEXT3).pack(side="left", padx=(4,0))
+
+        tk.Checkbutton(fi, text="Auto Refresh", variable=self.scanner_auto_refresh,
+                       bg=BG2, fg=TEXT2, selectcolor=ACCENT, activebackground=BG2,
+                       font=self.f_small, relief="flat", cursor="hand2").pack(side="left", padx=(16, 4))
+        tk.Label(fi, text="Every", font=self.f_small, bg=BG2, fg=TEXT3).pack(side="left", padx=(6, 4))
+        ttk.Combobox(fi, textvariable=self.scanner_auto_interval, width=4, state="readonly",
+                     values=[1, 3, 5, 10, 15]).pack(side="left")
+        tk.Label(fi, text="min", font=self.f_small, bg=BG2, fg=TEXT3).pack(side="left", padx=(4, 0))
 
         # ── Split view: Bullish left, Bearish right ──
         split = tk.Frame(parent, bg=BG)
@@ -2480,12 +3309,22 @@ class TradingApp(tk.Tk):
         expiry_date = next_dte_expiry(14)
         self.scan_expiry.set(expiry_date.strftime("%Y-%m-%d"))
         self.scanner_running = True
+        self.last_scanner_run_ts = time.time()
         self.scan_status.config(text="Rebalancing SPMO-style momentum universe...", fg=YELLOW)
         self.scan_status.config(
             text=f"Building {MOMENTUM_REBALANCE} momentum list for fixed 14-day expiry {expiry_date:%Y-%m-%d}...",
             fg=YELLOW
         )
         threading.Thread(target=self._scanner_thread, args=(expiry_date,), daemon=True).start()
+
+    def _maybe_auto_refresh_scanner(self):
+        if not hasattr(self, "scanner_auto_refresh") or not self.scanner_auto_refresh.get():
+            return
+        if self.scanner_running:
+            return
+        interval_sec = max(self.scanner_auto_interval.get(), 1) * 60
+        if time.time() - self.last_scanner_run_ts >= interval_sec:
+            self.after(0, self._run_scanner)
 
     def _scanner_thread(self, expiry_date):
         results = []
@@ -2537,18 +3376,28 @@ class TradingApp(tk.Tk):
             [r for r in self.scanner_results if r["bear_score"] >= min_score],
             key=lambda x: x["bear_score"], reverse=True
         )
+        cc_list = sorted(
+            [r for r in self.scanner_results if r.get("cc_score", 0) >= min_score],
+            key=lambda x: x.get("cc_score", 0), reverse=True
+        )
+        lp_list = sorted(
+            [r for r in self.scanner_results if r.get("lp_score", 0) >= min_score],
+            key=lambda x: x.get("lp_score", 0), reverse=True
+        )
 
         if filt == "BEAR":
             bull_call_list = []
             bull_put_list = []
+            cc_list = []
         if filt == "BULL":
             bear_list = []
+            lp_list = []
 
         def score_color(s):
             return GREEN if s >= 75 else YELLOW if s >= 60 else TEXT2
 
         def make_row(parent, r, strategy):
-            is_bull = strategy in ("bull_call", "bull_put")
+            is_bull = strategy in ("bull_call", "bull_put", "covered_call")
             bg_c = "#0d1a0d" if is_bull else "#1a0d0d"
             row = tk.Frame(parent, bg=bg_c,
                            highlightbackground=BORDER, highlightthickness=1,
@@ -2563,6 +3412,7 @@ class TradingApp(tk.Tk):
                 buy_s = r["bull_buy"]
                 sell_s = r["bull_sell"]
                 wrong_way = r["bull_wrong_way"]
+                score_val = r["bull_score"]
             elif strategy == "bull_put":
                 strategy_label = "Bull Put"
                 entry = r["bull_put_credit"]
@@ -2571,6 +3421,25 @@ class TradingApp(tk.Tk):
                 buy_s = r["bull_put_buy"]
                 sell_s = r["bull_put_sell"]
                 wrong_way = r["bull_put_wrong_way"]
+                score_val = r["bull_put_score"]
+            elif strategy == "covered_call":
+                strategy_label = "Cov Call"
+                entry = r["cc_premium"]
+                pnl = r["cc_premium"]
+                rr = r.get("cc_annualized", 0)   # annualised yield as R:R column
+                buy_s = r["price"]               # stock price (you own the shares)
+                sell_s = r["cc_strike"]
+                wrong_way = r["cc_wrong_way"]
+                score_val = r.get("cc_score", 0)
+            elif strategy == "long_put":
+                strategy_label = "Long Put"
+                entry = r["lp_debit"]
+                pnl = r["lp_break_even"]
+                rr = r["lp_rr"]
+                buy_s = r["lp_strike"]
+                sell_s = 0
+                wrong_way = r["lp_wrong_way"]
+                score_val = r.get("lp_score", 0)
             else:
                 strategy_label = "Bear Put"
                 entry = r["bear_debit"]
@@ -2579,22 +3448,41 @@ class TradingApp(tk.Tk):
                 buy_s = r["bear_buy"]
                 sell_s = r["bear_sell"]
                 wrong_way = r["bear_wrong_way"]
-            sig_color = GREEN if is_bull else RED
+                score_val = r["bear_score"]
+            sig_color  = GREEN if is_bull else RED
             risk_color = RED if wrong_way >= 0.5 else YELLOW if wrong_way >= 0.35 else GREEN
+            sc_color   = score_color(score_val)
+
+            if strategy == "covered_call":
+                sell_disp = f"${sell_s:.0f}"
+                buy_disp  = "Own"
+                rr_disp   = f"{rr:.0f}%/yr"
+                pnl_disp  = f"${pnl:.2f} cr"
+            elif strategy == "long_put":
+                sell_disp = "—"
+                buy_disp  = f"${buy_s:.0f}"
+                rr_disp   = f"{rr}:1"
+                pnl_disp  = f"${pnl:.2f} BE"
+            else:
+                sell_disp = f"${sell_s:.0f}"
+                buy_disp  = f"${buy_s:.0f}"
+                rr_disp   = f"{rr}:1"
+                pnl_disp  = f"${pnl:.2f}"
 
             cols = [
-                (strategy_label,       10, sig_color),
-                (r["ticker"],          6,  sig_color),
-                (f"${r['price']:.2f}", 8,  TEXT),
-                (f"${buy_s:.0f}",      6,  TEXT2),
-                (f"${sell_s:.0f}",     6,  TEXT2),
-                (r["expiry_date"],     10, ACCENT2),
-                (f"${entry:.2f}",      7,  YELLOW),
-                (f"${pnl:.2f}",        10, GREEN),
-                (f"{rr}:1",            5,  CYAN),
-                (f"{wrong_way * 100:.0f}%", 7,  risk_color),
-                (f"{r['rsi']:.0f}",    5,  TEXT2),
-                ("🎯 Score Entry",      12, ACCENT),
+                (strategy_label,        10, sig_color),
+                (r["ticker"],           6,  sig_color),
+                (f"${r['price']:.2f}",  8,  TEXT),
+                (buy_disp,              6,  TEXT2),
+                (sell_disp,             6,  TEXT2),
+                (r["expiry_date"],      10, ACCENT2),
+                (f"${entry:.2f}",       7,  YELLOW),
+                (pnl_disp,              10, GREEN),
+                (rr_disp,               6,  CYAN),
+                (f"{wrong_way*100:.0f}%", 7, risk_color),
+                (f"{r['rsi']:.0f}",     5,  TEXT2),
+                (f"★{score_val}",       5,  sc_color),
+                ("🎯 Rate Entry",        12, ACCENT),
             ]
             for val, w, fg in cols:
                 lbl = tk.Label(row, text=val, font=self.f_mono_s, bg=bg_c,
@@ -2608,7 +3496,7 @@ class TradingApp(tk.Tk):
             row.bind("<Button-1>",
                 lambda e, rec=r, strat=strategy: self._open_entry_scorer_strategy(rec, strat))
 
-        if not bull_call_list and not bull_put_list:
+        if not bull_call_list and not bull_put_list and not cc_list:
             tk.Label(self.bull_inner, text="No bullish setups above threshold",
                      font=self.f_body, bg=BG, fg=TEXT3).pack(pady=10)
         else:
@@ -2622,13 +3510,26 @@ class TradingApp(tk.Tk):
                          font=self.f_small, bg=BG, fg=TEXT3).pack(anchor="w", pady=(8,4))
                 for r in bull_put_list[:10]:
                     make_row(self.bull_inner, r, strategy="bull_put")
+            if cc_list:
+                tk.Label(self.bull_inner, text="Covered Calls  (sell OTM call vs owned shares)",
+                         font=self.f_small, bg=BG, fg=TEXT3).pack(anchor="w", pady=(8,4))
+                for r in cc_list[:10]:
+                    make_row(self.bull_inner, r, strategy="covered_call")
 
-        if not bear_list:
+        if not bear_list and not lp_list:
             tk.Label(self.bear_inner, text="No bearish setups above threshold",
                      font=self.f_body, bg=BG, fg=TEXT3).pack(pady=10)
         else:
-            for r in bear_list[:15]:
-                make_row(self.bear_inner, r, strategy="bear_put")
+            if bear_list:
+                tk.Label(self.bear_inner, text="Bear Put Spreads",
+                         font=self.f_small, bg=BG, fg=TEXT3).pack(anchor="w", pady=(0,4))
+                for r in bear_list[:10]:
+                    make_row(self.bear_inner, r, strategy="bear_put")
+            if lp_list:
+                tk.Label(self.bear_inner, text="Long Puts  (directional bearish)",
+                         font=self.f_small, bg=BG, fg=TEXT3).pack(anchor="w", pady=(8,4))
+                for r in lp_list[:10]:
+                    make_row(self.bear_inner, r, strategy="long_put")
 
         self.bull_canvas_ref.update_idletasks()
         self.bull_canvas_ref.configure(scrollregion=self.bull_canvas_ref.bbox("all"))
@@ -2921,6 +3822,40 @@ class TradingApp(tk.Tk):
                 "support_text": "price to hold below resistance",
                 "strategy_name": "Bear put spread",
             },
+            "covered_call": {
+                "title": "Covered Call",
+                "direction": "COVERED CALL",
+                "color": GREEN,
+                "is_bull": True,
+                "buy": r["price"],
+                "sell": r.get("cc_strike", 0),
+                "entry_label": "Credit",
+                "entry_value": r.get("cc_premium", 0),
+                "pnl_label": "Max Income",
+                "pnl_value": r.get("cc_premium", 0),
+                "risk_value": r.get("cc_premium", 0),
+                "wrong_way": r.get("cc_wrong_way", 0),
+                "rr": r.get("cc_annualized", 0),
+                "support_text": "stock to stay below the short call strike",
+                "strategy_name": "Covered call",
+            },
+            "long_put": {
+                "title": "Long Put",
+                "direction": "LONG PUT",
+                "color": RED,
+                "is_bull": False,
+                "buy": r.get("lp_strike", 0),
+                "sell": 0,
+                "entry_label": "Debit",
+                "entry_value": r.get("lp_debit", 0),
+                "pnl_label": "Break-Even",
+                "pnl_value": r.get("lp_break_even", 0),
+                "risk_value": r.get("lp_debit", 0),
+                "wrong_way": r.get("lp_wrong_way", 0),
+                "rr": r.get("lp_rr", 0),
+                "support_text": "stock to fall below the put strike",
+                "strategy_name": "Long put",
+            },
         }[strategy]
 
         win = tk.Toplevel(self)
@@ -2934,53 +3869,120 @@ class TradingApp(tk.Tk):
         hdr.pack(fill="x")
         tk.Label(hdr, text=f"{r['ticker']}  -  {strategy_cfg['direction']}",
                  font=self.f_head, bg=BG2, fg=strategy_cfg["color"]).pack()
-        tk.Label(
-            hdr,
-            text=(
+        if strategy == "covered_call":
+            hdr_detail = (
+                f"Stock ${strategy_cfg['buy']:.2f}  |  Sell Call ${strategy_cfg['sell']:.0f}  |  "
+                f"Credit ${strategy_cfg['entry_value']:.2f}  |  "
+                f"Annualised {strategy_cfg['rr']:.0f}%/yr  |  "
+                f"Downside {strategy_cfg['wrong_way']*100:.0f}% risk"
+            )
+        elif strategy == "long_put":
+            hdr_detail = (
+                f"Buy Put ${strategy_cfg['buy']:.0f}  |  "
+                f"Debit ${strategy_cfg['entry_value']:.2f}  |  "
+                f"Break-Even ${strategy_cfg['pnl_value']:.2f}  |  "
+                f"R:R {strategy_cfg['rr']}:1  |  "
+                f"Expires worthless {strategy_cfg['wrong_way']*100:.0f}%"
+            )
+        else:
+            hdr_detail = (
                 f"Buy ${strategy_cfg['buy']:.0f} / Sell ${strategy_cfg['sell']:.0f}  |  "
                 f"{strategy_cfg['entry_label']} ${strategy_cfg['entry_value']:.2f}  |  "
                 f"{strategy_cfg['pnl_label']} ${strategy_cfg['pnl_value']:.2f}  |  "
-                f"R:R {strategy_cfg['rr']}:1  |  Wrong-Way {strategy_cfg['wrong_way'] * 100:.0f}%"
-            ),
-            font=self.f_small, bg=BG2, fg=TEXT2
-        ).pack(pady=(2, 0))
+                f"R:R {strategy_cfg['rr']}:1  |  Wrong-Way {strategy_cfg['wrong_way']*100:.0f}%"
+            )
+        tk.Label(hdr, text=hdr_detail, font=self.f_small, bg=BG2, fg=TEXT2).pack(pady=(2, 0))
 
         above_50 = r.get("above_50", False)
         rsi = r.get("rsi", 50)
         mom5 = r.get("mom5", 0)
         iv = r.get("iv", 0.25)
 
-        if is_bull:
+        if strategy == "covered_call":
             daily_trend_auto = 1 if above_50 else 0
-            rsi_auto = 1 if rsi < 55 else 0
-            momentum_auto = 1 if mom5 > 0 else 0
-        else:
+            rsi_auto         = 1 if 40 <= rsi <= 65 else 0
+            momentum_auto    = 1 if 0 < mom5 < 6 else 0
+            iv_auto          = 1 if iv > 0.25 else 0
+            questions = [
+                ("Stock in mild uptrend?",                2, daily_trend_auto,
+                 f"Price above 50 MA ({above_50}) — auto-detected"),
+                ("Sell strike at key resistance?",        2, None,
+                 f"${strategy_cfg['sell']:.0f} should be near chart resistance — check weekly chart"),
+                ("RSI not overbought (<65)?",             1, rsi_auto,
+                 f"RSI is {rsi:.0f} — selling into overbought risk assignment too soon"),
+                ("IV elevated (premium worth it)?",       1, iv_auto,
+                 f"IV ~{iv:.0%} — want >25% for meaningful income. {'Good' if iv > 0.25 else 'Low premium'}"),
+                ("No major earnings before expiry?",      2, None,
+                 "Check earnings calendar — IV crush after earnings can hurt premium quality"),
+                ("Premium > 1% of stock price?",          1, 1 if iv > 0.20 else 0,
+                 f"${strategy_cfg['entry_value']:.2f} / ${r['price']:.2f} = {strategy_cfg['entry_value']/r['price']*100:.1f}% — want >1%"),
+                ("Would you be OK holding the stock?",    1, None,
+                 "Covered call = you stay long the stock. If you'd hate owning it, skip it."),
+                ("VIX below 30?",                         1, None,
+                 "VIX > 30 = vol spike — wait for calmer tape to sell premium"),
+                ("Momentum not too strong (not chasing)?",1, momentum_auto,
+                 f"5-day mom {mom5:.1f}% — if stock is running hard, cap is costly"),
+                ("Time is 10am-11:30am or 2pm-3:30pm?",  None, None,
+                 "Best windows to sell premium — avoid opening and closing volatility"),
+            ]
+        elif strategy == "long_put":
             daily_trend_auto = 1 if not above_50 else 0
-            rsi_auto = 1 if rsi > 45 else 0
-            momentum_auto = 1 if mom5 < 0 else 0
-
-        iv_auto = 1 if iv > 0.25 else 0
-        questions = [
-            ("Daily trend agrees with direction?", 2, daily_trend_auto,
-             f"Price {'above' if is_bull else 'below'} 50 MA -> auto-detected"),
-            ("Hourly trend confirms?", 2, None,
-             "Check hourly chart -> higher highs/lows for bull, lower for bear"),
-            ("RSI in right zone?", 1, rsi_auto,
-             f"RSI is {rsi:.0f} -> {'good for bull (<55)' if is_bull else 'good for bear (>45)'}"),
-            ("Volume confirms the move?", 1, None,
-             "Today's volume higher than average? Check thinkorswim"),
-            ("Clear S/R level identified?", 1, None,
-             "Can you see a clear support (bull) or resistance (bear) level on chart?"),
-            ("Breakout/Bounce trigger seen?", 1, None,
-             "Price just broke resistance (bull) or bounced off support (bear)?"),
-            ("VIX below 25?", 1, None, "Low VIX = calmer tape. Check VIX."),
-            ("Put/Call ratio agrees?", 1, None,
-             f"{'Below 0.7 = bullish' if is_bull else 'Above 1.0 = bearish'} -> check barchart.com"),
-            ("IV elevated for good premium?", 1, iv_auto,
-             f"IV estimated at {iv:.0%} -> {'good premium' if iv > 0.25 else 'low premium'}"),
-            ("Time is 10am-11:30am or 2pm-3:30pm?", None, None,
-             "Best entry windows -> avoid first 30 min and last 30 min"),
-        ]
+            rsi_auto         = 1 if rsi > 55 else 0
+            momentum_auto    = 1 if mom5 < -2 else 0
+            iv_auto          = 1 if iv < 0.35 else 0
+            questions = [
+                ("Stock in downtrend?",                   2, daily_trend_auto,
+                 f"Price {'above' if above_50 else 'below'} 50 MA — auto-detected"),
+                ("RSI elevated or turning down?",         2, rsi_auto,
+                 f"RSI is {rsi:.0f} — ideally >55 for bearish entry"),
+                ("Negative momentum?",                    1, momentum_auto,
+                 f"5-day momentum {mom5:.1f}% — want <-2% for conviction"),
+                ("IV not already sky-high?",              1, iv_auto,
+                 f"IV ~{iv:.0%} — buying puts when IV is high means overpaying. Want <35%"),
+                ("Volume confirms breakdown?",            1, None,
+                 "Today's vol > average on a down day? Check thinkorswim"),
+                ("Key support broken?",                   2, None,
+                 f"Has stock broken below a clear support level? Strike ${strategy_cfg['buy']:.0f}"),
+                ("VIX below 25?",                         1, None,
+                 "Low VIX = cheap puts. High VIX = expensive. Best to buy when VIX is calm."),
+                ("Put/Call ratio bearish (>0.9)?",        1, None,
+                 "Check barchart.com — elevated put/call = institutional hedging/bearish"),
+                ("No upcoming catalyst that could reverse?", None, None,
+                 "Earnings, Fed, macro events? A surprise reversal kills long puts fast"),
+                ("Time is 10am-11:30am or 2pm-3:30pm?",  None, None,
+                 "Best entry windows — avoid opening gap noise and closing melt-up"),
+            ]
+        else:
+            if is_bull:
+                daily_trend_auto = 1 if above_50 else 0
+                rsi_auto         = 1 if rsi < 55 else 0
+                momentum_auto    = 1 if mom5 > 0 else 0
+            else:
+                daily_trend_auto = 1 if not above_50 else 0
+                rsi_auto         = 1 if rsi > 45 else 0
+                momentum_auto    = 1 if mom5 < 0 else 0
+            iv_auto = 1 if iv > 0.25 else 0
+            questions = [
+                ("Daily trend agrees with direction?", 2, daily_trend_auto,
+                 f"Price {'above' if is_bull else 'below'} 50 MA -> auto-detected"),
+                ("Hourly trend confirms?", 2, None,
+                 "Check hourly chart -> higher highs/lows for bull, lower for bear"),
+                ("RSI in right zone?", 1, rsi_auto,
+                 f"RSI is {rsi:.0f} -> {'good for bull (<55)' if is_bull else 'good for bear (>45)'}"),
+                ("Volume confirms the move?", 1, None,
+                 "Today's volume higher than average? Check thinkorswim"),
+                ("Clear S/R level identified?", 1, None,
+                 "Can you see a clear support (bull) or resistance (bear) level on chart?"),
+                ("Breakout/Bounce trigger seen?", 1, None,
+                 "Price just broke resistance (bull) or bounced off support (bear)?"),
+                ("VIX below 25?", 1, None, "Low VIX = calmer tape. Check VIX."),
+                ("Put/Call ratio agrees?", 1, None,
+                 f"{'Below 0.7 = bullish' if is_bull else 'Above 1.0 = bearish'} -> check barchart.com"),
+                ("IV elevated for good premium?", 1, iv_auto,
+                 f"IV estimated at {iv:.0%} -> {'good premium' if iv > 0.25 else 'low premium'}"),
+                ("Time is 10am-11:30am or 2pm-3:30pm?", None, None,
+                 "Best entry windows -> avoid first 30 min and last 30 min"),
+            ]
 
         scroll_c = tk.Canvas(win, bg=BG, highlightthickness=0)
         sb = ttk.Scrollbar(win, orient="vertical", command=scroll_c.yview)
@@ -3075,38 +4077,83 @@ class TradingApp(tk.Tk):
         max_possible = sum(pts for _, pts in answer_vars if pts)
         score_10 = round((earned / max_possible) * 10, 1)
 
+        is_cc = strategy_name == "Covered call"
+        is_lp = strategy_name == "Long put"
+
         if score_10 >= 8:
             color = GREEN
             verdict = "HIGH CONVICTION - ENTER NOW"
-            size = f"Up to 15 contracts  (max ${risk_value*1500:.0f} risk)"
-            action = (
-                f"Strong setup. {strategy_name} confirmed by {answered} indicators. "
-                f"Enter between 10:00-11:30 AM if price action stays clean. "
-                f"Set stop loss at 50% of {'credit received' if entry_label == 'Credit' else 'debit paid'}. "
-                f"Target: close at 75% of max profit."
-            )
+            if is_cc:
+                size   = "Sell CC on full position  (all 100-share lots you hold)"
+                action = (
+                    f"Strong setup. {strategy_name} confirmed by {answered} checks. "
+                    f"Sell the ${risk_value:.2f} credit call now — strike sits at resistance. "
+                    f"Let it expire or buy back at 25% of credit received to free up the position."
+                )
+            elif is_lp:
+                size   = f"5-10 contracts  (max ${risk_value*1000:.0f} at risk)"
+                action = (
+                    f"Strong bearish setup. {strategy_name} confirmed by {answered} indicators. "
+                    f"Buy puts between 10:00-11:30 AM. "
+                    f"Exit at 2-3× debit paid or cut if stock reclaims the key level."
+                )
+            else:
+                size   = f"Up to 15 contracts  (max ${risk_value*1500:.0f} risk)"
+                action = (
+                    f"Strong setup. {strategy_name} confirmed by {answered} indicators. "
+                    f"Enter between 10:00-11:30 AM if price action stays clean. "
+                    f"Set stop loss at 50% of {'credit received' if entry_label == 'Credit' else 'debit paid'}. "
+                    f"Target: close at 75% of max profit."
+                )
         elif score_10 >= 6:
             color = YELLOW
             verdict = "GOOD SETUP - ENTER STANDARD SIZE"
-            size = f"5-8 contracts  (max ${risk_value*800:.0f} risk)"
-            action = (
-                f"Solid setup but not all signals aligned. Enter with standard size. "
-                f"Wait for {support_text} before adding. "
-                f"Stop at 50% {'credit loss' if entry_label == 'Credit' else 'debit loss'}."
-            )
+            if is_cc:
+                size   = "Sell CC on 50-75% of your position"
+                action = (
+                    f"Solid income setup. Sell covered calls on part of your position. "
+                    f"Wait for {support_text}. "
+                    f"Buy back if stock spikes and credit doubles against you."
+                )
+            elif is_lp:
+                size   = f"3-5 contracts  (max ${risk_value*500:.0f} at risk)"
+                action = (
+                    f"Good bearish signal but not fully aligned. Enter standard size. "
+                    f"Wait for {support_text}. "
+                    f"Exit at 2× debit or cut at 50% debit loss."
+                )
+            else:
+                size   = f"5-8 contracts  (max ${risk_value*800:.0f} risk)"
+                action = (
+                    f"Solid setup but not all signals aligned. Enter with standard size. "
+                    f"Wait for {support_text} before adding. "
+                    f"Stop at 50% {'credit loss' if entry_label == 'Credit' else 'debit loss'}."
+                )
         elif score_10 >= 4:
             color = YELLOW
             verdict = "WEAK SETUP - WAIT OR SKIP"
-            size = "1-2 contracts only  (small test)"
-            action = (
-                "Too many signals missing. Best to wait for more confirmation. "
-                "If you must enter, use minimal size and a tight stop."
-            )
+            if is_cc:
+                size   = "Sell CC on 25% of position only"
+                action = "Conditions marginal — sell small or wait for IV to rise or stock to reach resistance."
+            elif is_lp:
+                size   = "1-2 contracts only  (small test)"
+                action = "Too many signals missing. Wait for breakdown confirmation before sizing up."
+            else:
+                size   = "1-2 contracts only  (small test)"
+                action = (
+                    "Too many signals missing. Best to wait for more confirmation. "
+                    "If you must enter, use minimal size and a tight stop."
+                )
         else:
             color = RED
             verdict = "SKIP THIS TRADE"
             size = "Do NOT enter"
-            action = "Setup not confirmed. Waiting for a cleaner entry is the better trade."
+            if is_cc:
+                action = "Conditions not right for selling premium here. Wait for higher IV or better trend alignment."
+            elif is_lp:
+                action = "No clear bearish edge. Forcing a long put here risks a full debit loss. Wait for a cleaner setup."
+            else:
+                action = "Setup not confirmed. Waiting for a cleaner entry is the better trade."
 
         score_lbl.config(text=f"{score_10:.1f} / 10", fg=color)
         verdict_lbl.config(text=verdict, fg=color)
@@ -3306,12 +4353,20 @@ class TradingApp(tk.Tk):
             if not is_demo_mode():
                 for ticker in list(PORTFOLIO.keys()) + ["SPY","QQQ","SPMO"]:
                     self.history_data[ticker] = fetch_history(ticker)
+                    self.history_series_data[ticker] = fetch_history_series(ticker, period="2y")
+                    if ticker in PORTFOLIO:
+                        self.earnings_timeline_data[ticker] = fetch_earnings_timeline_yahoo(ticker)
+                for ticker in AI_THEME_TICKERS:
+                    if ticker not in self.history_data:
+                        self.history_data[ticker] = fetch_history(ticker)
 
             # Refresh earnings cards now that we have dates
             self.after(0, self._refresh_earnings_labels)
+            self.after(0, self._render_earnings_dashboard)
 
             while self.is_running:
                 self._refresh_data()
+                self._maybe_auto_refresh_scanner()
                 time.sleep(30)
         t = threading.Thread(target=run, daemon=True)
         t.start()
@@ -3346,7 +4401,7 @@ class TradingApp(tk.Tk):
         threading.Thread(target=self._refresh_data, daemon=True).start()
 
     def _refresh_data(self):
-        all_symbols = list(PORTFOLIO.keys()) + ["SPY", "QQQ", "SPMO"]
+        all_symbols = list(dict.fromkeys(list(PORTFOLIO.keys()) + list(ETF_SYMBOLS) + list(SCAN_UNIVERSE) + AI_THEME_TICKERS))
 
         if is_demo_mode():
             # Fallback mock data
@@ -3419,12 +4474,13 @@ class TradingApp(tk.Tk):
             refs["rsi_lbl"].config(text=str(int(rsi)), fg=GREEN if rsi < 35 else RED if rsi > 65 else TEXT2)
 
             # Income
-            prem    = est_premium(price, cfg["call_strike"])
+            dte     = covered_call_dte()
+            prem    = est_premium(price, cfg["call_strike"], dte=dte)
             weekly  = prem * 100 * (cfg["shares"] // 100)
             monthly = weekly * 4.3
             total_w += weekly
             total_m += monthly
-            refs["income"].config(text=f"Call ${cfg['call_strike']} → ${weekly:.0f}/wk")
+            refs["income"].config(text=f"Call ${cfg['call_strike']} -> ${weekly:.0f}/wk")
 
             # Highlight selected
             border_col = ACCENT if self.selected_ticker.get() == ticker else BORDER
@@ -3502,9 +4558,15 @@ class TradingApp(tk.Tk):
 
         # Alerts
         self._render_alerts(alerts)
+        self._render_movers()
+        self._render_ai_themes()
+        self._render_earnings_dashboard()
 
     def _update_detail(self, ticker, price, chg, pct, rsi, ma50, ma200, sig, sig_color, prem, weekly):
         cfg = PORTFOLIO[ticker]
+        dte = covered_call_dte()
+        expiry_label = covered_call_expiry_label()
+        self.detail_call_title.config(text=f"COVERED CALL - {expiry_label} Expiry")
         self.detail_ticker.config(text=ticker, fg=cfg.get("color", ACCENT))
         chg_col = GREEN if chg >= 0 else RED
         arrow   = "▲" if chg >= 0 else "▼"
@@ -3522,10 +4584,11 @@ class TradingApp(tk.Tk):
         self.detail_labels["vs MA200"].config(
             text="↑ ABOVE" if a200 else "↓ BELOW", fg=GREEN if a200 else RED)
         self.detail_labels["Weekly Income"].config(text=f"${weekly:.0f}", fg=ACCENT2)
+        self._draw_detail_earnings_chart(ticker)
 
         self.detail_call.config(
             text=f"Strike: ${cfg['call_strike']}   Premium: ${prem:.2f}/share   "
-                 f"Income: ${weekly:.0f}/wk  →  ${weekly*4.3:.0f}/mo")
+                 f"Income: ${weekly:.0f}/wk  ->  ${weekly*4.3:.0f}/mo   ({dte} DTE)")
         earn = get_earnings(ticker)
         days = self._days_to_earnings(earn)
         earn_text = f"⚠️  Earnings: {earn}"
@@ -3552,7 +4615,8 @@ class TradingApp(tk.Tk):
                 ma50  = calc_ma(hist, 50)
                 ma200 = calc_ma(hist, 200)
             sig, sig_color, _ = get_signal(price, rsi, ma50 or price, ma200 or price)
-            prem   = est_premium(price, cfg["call_strike"])
+            dte    = covered_call_dte()
+            prem   = est_premium(price, cfg["call_strike"], dte=dte)
             weekly = prem * 100 * (cfg["shares"] // 100)
             self._update_detail(ticker, d["price"], d["change"], d["pct"],
                                 rsi, ma50, ma200, sig, sig_color, prem, weekly)
