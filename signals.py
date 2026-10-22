@@ -3,7 +3,10 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 
 from config import YFINANCE_OK, yf, GREEN, RED, YELLOW, logger
-from indicators import calc_rsi, calc_ma, calc_atr, find_local_extrema
+from indicators import (
+    calc_rsi, calc_ma, calc_atr, find_local_extrema,
+    calc_macd, calc_bollinger, calc_keltner, calc_adx, calc_obv, calc_cmf,
+)
 from schwab_data import get_requests_verify_setting
 from yahoo_data import create_yahoo_session
 
@@ -165,6 +168,121 @@ def detect_statistical_signals(closes, highs, lows):
             "level": anchor,
             "prediction": "Not enough edge yet; watch trend and volatility",
         })
+
+    return signals
+
+
+def detect_advanced_technical_signals(closes, highs, lows, volumes=None):
+    """
+    MACD momentum, Bollinger/Keltner squeeze, ADX trend strength, and (when volume
+    history is available) OBV/CMF volume confirmation. Each check only appends a row
+    when there's enough history to compute it, rather than forcing a fallback row.
+    """
+    if len(closes) < 35:
+        return []
+
+    signals = []
+    price = closes[-1]
+
+    macd_line, signal_line, histogram = calc_macd(closes)
+    if len(histogram) >= 2:
+        if histogram[-2] <= 0 < histogram[-1]:
+            signals.append({
+                "name": "MACD", "bias": "Bullish", "confidence": 70,
+                "level": round(macd_line[-1], 3),
+                "prediction": "MACD crossed above signal line; bullish momentum shift",
+            })
+        elif histogram[-2] >= 0 > histogram[-1]:
+            signals.append({
+                "name": "MACD", "bias": "Bearish", "confidence": 70,
+                "level": round(macd_line[-1], 3),
+                "prediction": "MACD crossed below signal line; bearish momentum shift",
+            })
+        else:
+            bias = "Bullish" if histogram[-1] > 0 else "Bearish" if histogram[-1] < 0 else "Neutral"
+            signals.append({
+                "name": "MACD", "bias": bias, "confidence": 52,
+                "level": round(macd_line[-1], 3),
+                "prediction": f"MACD histogram {'positive' if histogram[-1] > 0 else 'negative'}; momentum still {bias.lower()}",
+            })
+
+    bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
+    kc_upper, kc_mid, kc_lower = calc_keltner(highs, lows, closes)
+    if bb_upper and kc_upper:
+        squeeze_on = bb_upper < kc_upper and bb_lower > kc_lower
+        if squeeze_on:
+            signals.append({
+                "name": "Bollinger/Keltner Squeeze", "bias": "Neutral", "confidence": 55,
+                "level": bb_mid,
+                "prediction": "Volatility squeeze (Bollinger inside Keltner); breakout pending",
+            })
+        elif price > bb_upper:
+            signals.append({
+                "name": "Bollinger/Keltner Squeeze", "bias": "Bullish", "confidence": 68,
+                "level": bb_upper,
+                "prediction": "Price broke above upper Bollinger band; volatility expansion to the upside",
+            })
+        elif price < bb_lower:
+            signals.append({
+                "name": "Bollinger/Keltner Squeeze", "bias": "Bearish", "confidence": 68,
+                "level": bb_lower,
+                "prediction": "Price broke below lower Bollinger band; volatility expansion to the downside",
+            })
+
+    adx, plus_di, minus_di = calc_adx(highs, lows, closes)
+    if adx:
+        if adx < 20:
+            signals.append({
+                "name": "ADX Trend Strength", "bias": "Neutral", "confidence": 40,
+                "level": adx,
+                "prediction": f"ADX {adx} is below 20; choppy, no clear trend to follow",
+            })
+        else:
+            bias = "Bullish" if plus_di > minus_di else "Bearish"
+            conf = min(80, int(60 + min(adx - 20, 40) * 0.5))
+            strength = "strong" if adx > 40 else "developing"
+            signals.append({
+                "name": "ADX Trend Strength", "bias": bias, "confidence": conf,
+                "level": adx,
+                "prediction": f"ADX {adx} ({strength} trend), +DI {plus_di} vs -DI {minus_di}",
+            })
+
+    if volumes and len(volumes) >= max(20, len(closes) - 5):
+        cmf = calc_cmf(highs, lows, closes, volumes)
+        obv = calc_obv(closes, volumes)
+        if obv and len(obv) >= 10 and len(closes) >= 10:
+            obv_slope = obv[-1] - obv[-10]
+            price_slope = closes[-1] - closes[-10]
+            if cmf > 0.05 and price_slope > 0 and obv_slope > 0:
+                signals.append({
+                    "name": "Volume Flow", "bias": "Bullish", "confidence": 65,
+                    "level": cmf,
+                    "prediction": f"Money flow confirms the uptrend (CMF {cmf})",
+                })
+            elif cmf < -0.05 and price_slope < 0 and obv_slope < 0:
+                signals.append({
+                    "name": "Volume Flow", "bias": "Bearish", "confidence": 65,
+                    "level": cmf,
+                    "prediction": f"Money flow confirms the downtrend (CMF {cmf})",
+                })
+            elif price_slope > 0 and (cmf < 0 or obv_slope < 0):
+                signals.append({
+                    "name": "Volume Flow", "bias": "Bearish", "confidence": 50,
+                    "level": cmf,
+                    "prediction": "Price rising on weak/negative volume flow; possible divergence",
+                })
+            elif price_slope < 0 and (cmf > 0 or obv_slope > 0):
+                signals.append({
+                    "name": "Volume Flow", "bias": "Bullish", "confidence": 50,
+                    "level": cmf,
+                    "prediction": "Price falling while volume flow holds up; possible bullish divergence",
+                })
+            else:
+                signals.append({
+                    "name": "Volume Flow", "bias": "Neutral", "confidence": 45,
+                    "level": cmf,
+                    "prediction": f"Volume flow is mixed (CMF {cmf})",
+                })
 
     return signals
 

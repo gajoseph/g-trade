@@ -29,6 +29,101 @@ def calc_atr(highs, lows, closes, n=14):
     return round(sum(trs[-n:]) / n, 2)
 
 
+def calc_ema(prices, n):
+    if len(prices) < n: return []
+    k = 2 / (n + 1)
+    ema = [sum(prices[:n]) / n]
+    for p in prices[n:]:
+        ema.append(p * k + ema[-1] * (1 - k))
+    return ema
+
+
+def calc_macd(prices, fast=12, slow=26, signal=9):
+    if len(prices) < slow + signal: return [], [], []
+    ema_fast = calc_ema(prices, fast)
+    ema_slow = calc_ema(prices, slow)
+    offset = len(ema_fast) - len(ema_slow)
+    macd_line = [f - s for f, s in zip(ema_fast[offset:], ema_slow)]
+    if len(macd_line) < signal: return macd_line, [], []
+    signal_line = calc_ema(macd_line, signal)
+    offset2 = len(macd_line) - len(signal_line)
+    histogram = [m - s for m, s in zip(macd_line[offset2:], signal_line)]
+    return macd_line, signal_line, histogram
+
+
+def calc_bollinger(prices, n=20, num_std=2):
+    if len(prices) < n: return None, None, None
+    window = prices[-n:]
+    mid = sum(window) / n
+    variance = sum((p - mid) ** 2 for p in window) / n
+    std = math.sqrt(variance)
+    return round(mid + num_std * std, 2), round(mid, 2), round(mid - num_std * std, 2)
+
+
+def calc_keltner(highs, lows, closes, n=20, atr_mult=1.5):
+    if len(closes) < n: return None, None, None
+    ema = calc_ema(closes, n)
+    if not ema: return None, None, None
+    mid = ema[-1]
+    atr = calc_atr(highs, lows, closes, n)
+    return round(mid + atr_mult * atr, 2), round(mid, 2), round(mid - atr_mult * atr, 2)
+
+
+def calc_adx(highs, lows, closes, n=14):
+    if len(closes) < n * 2: return 0, 0, 0
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(closes)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
+        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+
+    def wilder_smooth(values, n):
+        smoothed = [sum(values[:n])]
+        for v in values[n:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] / n + v)
+        return smoothed
+
+    smoothed_tr = wilder_smooth(trs, n)
+    smoothed_plus_dm = wilder_smooth(plus_dm, n)
+    smoothed_minus_dm = wilder_smooth(minus_dm, n)
+
+    plus_di = [100 * pdm / tr if tr else 0 for pdm, tr in zip(smoothed_plus_dm, smoothed_tr)]
+    minus_di = [100 * mdm / tr if tr else 0 for mdm, tr in zip(smoothed_minus_dm, smoothed_tr)]
+    dx = [100 * abs(p - m) / (p + m) if (p + m) else 0 for p, m in zip(plus_di, minus_di)]
+
+    if len(dx) < n: return 0, round(plus_di[-1], 1), round(minus_di[-1], 1)
+    adx = sum(dx[:n]) / n
+    for d in dx[n:]:
+        adx = (adx * (n - 1) + d) / n
+    return round(adx, 1), round(plus_di[-1], 1), round(minus_di[-1], 1)
+
+
+def calc_obv(closes, volumes):
+    if len(closes) < 2 or len(volumes) < len(closes): return []
+    obv = [0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:
+            obv.append(obv[-1] + volumes[i])
+        elif closes[i] < closes[i-1]:
+            obv.append(obv[-1] - volumes[i])
+        else:
+            obv.append(obv[-1])
+    return obv
+
+
+def calc_cmf(highs, lows, closes, volumes, n=20):
+    if len(closes) < n or len(volumes) < n: return 0
+    mfv_sum, vol_sum = 0, 0
+    for i in range(-n, 0):
+        rng = highs[i] - lows[i]
+        mfm = ((closes[i] - lows[i]) - (highs[i] - closes[i])) / rng if rng else 0
+        mfv_sum += mfm * volumes[i]
+        vol_sum += volumes[i]
+    return round(mfv_sum / vol_sum, 3) if vol_sum else 0
+
+
 def estimate_iv(price, atr):
     if price <= 0 or atr <= 0: return 0.25
     return round(min(max((atr / price) * math.sqrt(252), 0.10), 2.0), 3)

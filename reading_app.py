@@ -9,12 +9,26 @@
 
   RUN:
   python trading_app.py
+
+  OPTIONS PRICING:
+  Covered-call premiums shown in the Dashboard/Income Tracker and the
+  Spread Scanner's covered-call column use a REAL options-chain quote
+  (bid/ask, mid-price) when one is available — from Schwab's chains
+  endpoint when DATA_SOURCE=schwab, otherwise from Yahoo via yfinance.
+  If no liquid quote is found for a strike, the app falls back to a
+  Black-Scholes estimate (est_premium/bs_call/bs_put) fed an IV guessed
+  from recent price volatility (ATR) — this estimate can meaningfully
+  diverge from real market pricing, especially around earnings. The
+  Income Tracker's premium column is colored to show which one you're
+  looking at (green = live chain quote, dim = model estimate). See the
+  "OPTIONS CHAIN" section below for fetch_option_chain / nearest_chain_quote.
 """
 
 import tkinter as tk
 from tkinter import ttk, font as tkfont, messagebox, simpledialog
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import json
 import os
@@ -77,6 +91,19 @@ try:
     MATPLOTLIB_OK = True
 except ImportError:
     MATPLOTLIB_OK = False
+
+# ─────────────────────────────────────────
+#  SHARED INDICATOR / SIGNAL LOGIC (indicators.py, signals.py)
+# ─────────────────────────────────────────
+from indicators import (
+    calc_rsi, calc_ma, calc_atr, find_local_extrema, get_signal,
+    calc_macd, calc_bollinger, calc_keltner, calc_adx, calc_obv, calc_cmf,
+)
+from signals import (
+    detect_patterns, detect_statistical_signals, detect_advanced_technical_signals,
+    detect_ml_forecast_signal, detect_options_flow_signal, detect_news_sentiment_signal,
+    score_ticker_signal_set,
+)
 
 # ─────────────────────────────────────────
 #  DATA SOURCE — SWITCH HERE WHEN READY
@@ -673,455 +700,285 @@ def is_demo_mode():
     return APP_KEY == DEFAULT_APP_KEY
 
 # ─────────────────────────────────────────
-#  INDICATORS
+#  OPTIONS CHAIN — real bid/ask/IV/open interest
+#
+#  est_premium/bs_call/bs_put (below) are a Black-Scholes MODEL fed an IV
+#  estimated from historical price swings (ATR) — a rough stand-in for real
+#  market IV. Where possible we now look up the actual quoted chain instead
+#  (Schwab's marketdata/v1/chains endpoint, or yfinance's option_chain for
+#  the default "yahoo" DATA_SOURCE) and only fall back to the Black-Scholes
+#  estimate when no liquid quote is available (e.g. Yahoo has no data, or
+#  the strike has no bid/ask). Chains are cached briefly since a single
+#  scan can touch 20+ tickers and the underlying HTTP calls are the slow
+#  part of a refresh.
 # ─────────────────────────────────────────
-def calc_rsi(prices, n=14):
-    if len(prices) < n + 1: return 50
-    g, l = [], []
-    for i in range(1, len(prices)):
-        d = prices[i] - prices[i-1]
-        g.append(max(d, 0)); l.append(max(-d, 0))
-    ag = sum(g[-n:]) / n; al = sum(l[-n:]) / n
-    if al == 0: return 100
-    return round(100 - 100 / (1 + ag / al), 1)
+_OPTION_CHAIN_CACHE = {}
+OPTION_CHAIN_TTL_SECONDS = int(os.environ.get("OPTION_CHAIN_TTL_SECONDS", "300"))
 
-def calc_ma(prices, n):
-    if len(prices) < n: return None
-    return round(sum(prices[-n:]) / n, 2)
+def _chain_cache_get(key):
+    entry = _OPTION_CHAIN_CACHE.get(key)
+    if not entry:
+        return None
+    fetched_at, data = entry
+    if time.time() - fetched_at > OPTION_CHAIN_TTL_SECONDS:
+        return None
+    return data
 
-def find_local_extrema(prices, order=3):
-    highs, lows = [], []
-    if len(prices) < order * 2 + 1:
-        return highs, lows
-    for i in range(order, len(prices) - order):
-        window = prices[i - order:i + order + 1]
-        center = prices[i]
-        if center == max(window):
-            highs.append((i, center))
-        if center == min(window):
-            lows.append((i, center))
-    return highs, lows
+def _chain_cache_set(key, data):
+    _OPTION_CHAIN_CACHE[key] = (time.time(), data)
 
-def detect_patterns(closes):
-    if len(closes) < 60:
-        return []
-
-    patterns = []
-    highs, lows = find_local_extrema(closes, order=3)
-    price = closes[-1]
-    ma50 = calc_ma(closes, 50)
-    ma200 = calc_ma(closes, min(200, len(closes)))
-
-    if len(highs) >= 3:
-        h1, h2, h3 = highs[-3], highs[-2], highs[-1]
-        shoulder_tol = 0.06
-        if h2[1] > h1[1] * 1.03 and h2[1] > h3[1] * 1.03 and abs(h1[1] - h3[1]) / max(h1[1], 1) <= shoulder_tol:
-            neckline = min(closes[h1[0]:h3[0] + 1]) if h3[0] > h1[0] else min(closes[-20:])
-            confidence = 70 if price < neckline else 55
-            patterns.append({
-                "name": "Head & Shoulders",
-                "bias": "Bearish",
-                "confidence": confidence,
-                "level": neckline,
-                "prediction": "Price drops after neckline break",
-            })
-
-    if len(lows) >= 2:
-        l1, l2 = lows[-2], lows[-1]
-        if abs(l1[1] - l2[1]) / max(l1[1], 1) <= 0.04 and price > max(l1[1], l2[1]) * 1.05:
-            breakout = max(closes[l1[0]:l2[0] + 1]) if l2[0] > l1[0] else price
-            patterns.append({
-                "name": "Double Bottom",
-                "bias": "Bullish",
-                "confidence": 68 if price > breakout else 58,
-                "level": breakout,
-                "prediction": "Price bounces up after confirmation",
-            })
-
-    if len(closes) >= 25:
-        rise = (closes[-10] - closes[-25]) / max(closes[-25], 1)
-        drift = (closes[-1] - closes[-10]) / max(closes[-10], 1)
-        pullback = min(closes[-10:]) / max(max(closes[-15:-10]), 1)
-        if rise > 0.08 and -0.06 <= drift <= 0.03 and pullback > 0.94:
-            breakout = max(closes[-10:])
-            patterns.append({
-                "name": "Bull Flag",
-                "bias": "Bullish",
-                "confidence": 64 if price >= breakout * 0.99 else 56,
-                "level": breakout,
-                "prediction": "Continues up after tight consolidation",
-            })
-
-    if ma50 and ma200 and len(closes) >= 201:
-        prev_ma50 = calc_ma(closes[:-1], 50)
-        prev_ma200 = calc_ma(closes[:-1], 200)
-        if prev_ma50 and prev_ma200 and prev_ma50 >= prev_ma200 and ma50 < ma200:
-            patterns.append({
-                "name": "Death Cross",
-                "bias": "Bearish",
-                "confidence": 72,
-                "level": ma200,
-                "prediction": "Downtrend ahead after 50/200 cross",
-            })
-
-    if len(closes) >= 50:
-        left = closes[-50:-25]
-        base = closes[-25:-8]
-        handle = closes[-8:]
-        if left and base and handle:
-            left_high = max(left)
-            base_low = min(base)
-            handle_low = min(handle)
-            recovered = closes[-1] >= left_high * 0.97
-            rounded = base_low < left_high * 0.92 and handle_low > base_low * 1.03
-            if recovered and rounded:
-                patterns.append({
-                    "name": "Cup & Handle",
-                    "bias": "Bullish",
-                    "confidence": 69 if price >= max(handle) else 60,
-                    "level": max(handle),
-                    "prediction": "Breakout up if handle high clears",
-                })
-
-    if not patterns:
-        trend_bias = "Bullish" if ma50 and ma200 and price > ma50 and price > ma200 else "Bearish" if ma50 and ma200 and price < ma50 and price < ma200 else "Neutral"
-        patterns.append({
-            "name": "No Clear Pattern",
-            "bias": trend_bias,
-            "confidence": 40,
-            "level": price,
-            "prediction": "Watch trend and consolidation",
-        })
-
-    return sorted(patterns, key=lambda x: x["confidence"], reverse=True)
-
-def detect_statistical_signals(closes, highs, lows):
-    if len(closes) < 20:
-        return []
-
-    signals = []
-    price = closes[-1]
-    ma5 = calc_ma(closes, 5)
-    ma20 = calc_ma(closes, 20)
-    ma50 = calc_ma(closes, 50)
-    rsi = calc_rsi(closes)
-    atr = calc_atr(highs, lows, closes) if len(closes) >= 15 else None
-
-    if ma5 and ma20:
-        slope = (ma5 - ma20) / max(ma20, 1)
-        forecast = price * (1 + slope)
-        bias = "Bullish" if slope > 0 else "Bearish" if slope < 0 else "Neutral"
-        conf = min(75, max(45, int(abs(slope) * 1000) + 50))
-        signals.append({
-            "name": "Moving Average Forecast",
-            "bias": bias,
-            "confidence": conf,
-            "level": forecast,
-            "prediction": f"Trend projection points to about ${forecast:.2f} next",
-        })
-
-    if ma20:
-        if rsi >= 80:
-            signals.append({
-                "name": "Mean Reversion",
-                "bias": "Bearish",
-                "confidence": 72,
-                "level": ma20,
-                "prediction": f"RSI {rsi:.0f} is stretched; likely drift back toward average",
-            })
-        elif rsi <= 20:
-            signals.append({
-                "name": "Mean Reversion",
-                "bias": "Bullish",
-                "confidence": 72,
-                "level": ma20,
-                "prediction": f"RSI {rsi:.0f} is washed out; likely bounce toward average",
-            })
-
-    if atr:
-        low_range = max(price - atr, 0)
-        high_range = price + atr
-        signals.append({
-            "name": "ATR Range",
-            "bias": "Neutral",
-            "confidence": 65,
-            "level": price,
-            "prediction": f"Expected near-term range ${low_range:.2f} to ${high_range:.2f}",
-        })
-
-    if not signals:
-        anchor = ma50 or ma20 or price
-        signals.append({
-            "name": "Moving Average Forecast",
-            "bias": "Neutral",
-            "confidence": 40,
-            "level": anchor,
-            "prediction": "Not enough edge yet; watch trend and volatility",
-        })
-
-    return signals
-
-def detect_ml_forecast_signal(closes, highs, lows):
+def fetch_option_chain_schwab(symbol, expiration_date=None):
     """
-    Lightweight ML-style directional forecast using engineered features instead of
-    a true LSTM. Fast enough for the desktop app and still useful for ranking.
+    Fetch one expiration's real chain from Schwab: bid/ask/last, IV, open
+    interest, volume and greeks per strike. Returns None on any failure so
+    callers can fall back to the Black-Scholes estimate.
     """
-    if len(closes) < 60:
-        return []
+    expiration_date = expiration_date or next_friday()
+    cache_key = ("schwab", symbol, expiration_date.isoformat())
+    cached = _chain_cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-    price = closes[-1]
-    rsi = calc_rsi(closes)
-    ma20 = calc_ma(closes, 20) or price
-    ma50 = calc_ma(closes, 50) or price
-    atr = calc_atr(highs, lows, closes) if len(closes) >= 15 else max(price * 0.02, 1)
-    mom5 = ((closes[-1] - closes[-6]) / closes[-6] * 100) if len(closes) >= 6 and closes[-6] else 0
-    mom20 = ((closes[-1] - closes[-21]) / closes[-21] * 100) if len(closes) >= 21 and closes[-21] else 0
-    trend20 = (price - ma20) / max(ma20, 1)
-    trend50 = (price - ma50) / max(ma50, 1)
-    vol_norm = atr / max(price, 1)
+    logger.info("fetch_option_chain_schwab: requesting chain for %s", symbol)
+    token = get_token()
+    if not token:
+        set_schwab_error("Cannot fetch Schwab option chain: no token.", level="warning")
+        return None
+    verify = get_requests_verify_setting()
+    try:
+        r = requests.get(
+            "https://api.schwabapi.com/marketdata/v1/chains",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "symbol": symbol,
+                "contractType": "ALL",
+                "strikeCount": 20,
+                "includeUnderlyingQuote": False,
+                "fromDate": expiration_date.isoformat(),
+                "toDate": expiration_date.isoformat(),
+            },
+            timeout=15, verify=verify,
+        )
+    except requests.exceptions.SSLError as e:
+        logger.exception("fetch_option_chain_schwab: ssl error")
+        set_schwab_error(f"Schwab SSL error during chain request: {e}", level="error")
+        return None
+    except Exception:
+        logger.exception("fetch_option_chain_schwab: network error")
+        set_schwab_error("Schwab chain request failed due to network error.", level="error")
+        return None
+    if r.status_code != 200:
+        logger.error("fetch_option_chain_schwab: failed with status %s body=%s", r.status_code, r.text[:500])
+        set_schwab_error(f"Schwab option chain failed ({r.status_code}).", level="error")
+        return None
 
-    # Simple weighted feature model that mimics a directional classifier.
-    score = (
-        mom5 * 0.35 +
-        mom20 * 0.25 +
-        trend20 * 100 * 0.20 +
-        trend50 * 100 * 0.15 +
-        ((50 - abs(rsi - 50)) / 50) * 4 -
-        vol_norm * 100 * 0.12
-    )
+    logger.info("fetch_option_chain_schwab: success for %s", symbol)
+    set_schwab_error(f"Schwab option chain loaded for {symbol}.", level="info")
+    raw = r.json()
+    chain = {"calls": {}, "puts": {}, "expiration": expiration_date, "source": "schwab"}
+    for side, map_key in (("calls", "callExpDateMap"), ("puts", "putExpDateMap")):
+        for _exp_key, strikes in (raw.get(map_key) or {}).items():
+            for strike_str, contracts in strikes.items():
+                if not contracts:
+                    continue
+                c = contracts[0]
+                try:
+                    strike = float(strike_str)
+                except ValueError:
+                    continue
+                chain[side][strike] = {
+                    "bid": c.get("bid") or 0,
+                    "ask": c.get("ask") or 0,
+                    "last": c.get("last") or 0,
+                    "iv": (c.get("volatility") or 0) / 100,   # Schwab reports IV as e.g. 24.5, not 0.245
+                    "open_interest": c.get("openInterest") or 0,
+                    "volume": c.get("totalVolume") or 0,
+                    "delta": c.get("delta"),
+                    "theta": c.get("theta"),
+                }
+    _chain_cache_set(cache_key, chain)
+    return chain
 
-    if score > 1.5:
-        bias = "Bullish"
-        confidence = min(78, max(52, int(55 + score * 2.2)))
-        target = price + atr * (1.2 + min(score / 10, 0.8))
-        prediction = f"ML-style model leans up toward about ${target:.2f}"
-    elif score < -1.5:
-        bias = "Bearish"
-        confidence = min(78, max(52, int(55 + abs(score) * 2.2)))
-        target = max(price - atr * (1.2 + min(abs(score) / 10, 0.8)), 0)
-        prediction = f"ML-style model leans down toward about ${target:.2f}"
-    else:
-        bias = "Neutral"
-        confidence = 48
-        target = price
-        prediction = f"ML-style model sees range-bound trade near ${price:.2f}"
-
-    return [{
-        "name": "ML Forecast",
-        "bias": bias,
-        "confidence": confidence,
-        "level": target,
-        "prediction": prediction,
-    }]
-
-def detect_options_flow_signal(ticker):
+def fetch_option_chain_yahoo(symbol, expiration_date=None):
     """
-    Proxy for unusual options activity using near-dated option-chain volume/open interest.
-    This is not true tape/flow data, but it can still flag unusual call or put activity.
+    Fetch one expiration's real chain from Yahoo via yfinance: bid/ask/last,
+    IV and open interest per strike. Yahoo has no greeks, unlike Schwab.
+    Picks the listed expiration closest to expiration_date when an exact
+    match isn't available (Yahoo only lists real option series, which don't
+    always land on the Friday our covered-call logic targets).
     """
     if not YFINANCE_OK:
-        return []
+        return None
+    cache_key = ("yahoo", symbol, expiration_date.isoformat() if expiration_date else "auto")
+    cached = _chain_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        t = yf.Ticker(ticker, session=create_yahoo_session())
-        expiries = list(t.options or [])
-        if not expiries:
-            return []
-        expiry = expiries[0]
-        chain = t.option_chain(expiry)
-        calls = chain.calls
-        puts = chain.puts
-        if calls is None or puts is None or calls.empty or puts.empty:
-            return []
-
-        call_vol = float(calls["volume"].fillna(0).sum())
-        put_vol = float(puts["volume"].fillna(0).sum())
-        call_oi = float(calls["openInterest"].fillna(0).sum())
-        put_oi = float(puts["openInterest"].fillna(0).sum())
-
-        if call_vol <= 0 and put_vol <= 0:
-            return []
-
-        call_to_put = call_vol / max(put_vol, 1.0)
-        call_surge = call_vol / max(call_oi, 1.0)
-        put_surge = put_vol / max(put_oi, 1.0)
-
-        signals = []
-        if call_to_put >= 1.8 and call_surge >= 0.12:
-            conf = min(82, int(55 + call_to_put * 8 + call_surge * 40))
-            signals.append({
-                "name": "Unusual Options Activity",
-                "bias": "Bullish",
-                "confidence": conf,
-                "level": call_to_put,
-                "prediction": f"Unusual call activity: call/put vol {call_to_put:.1f}x into {expiry}",
-            })
-        elif put_vol > 0 and (put_vol / max(call_vol, 1.0)) >= 1.8 and put_surge >= 0.12:
-            put_to_call = put_vol / max(call_vol, 1.0)
-            conf = min(82, int(55 + put_to_call * 8 + put_surge * 40))
-            signals.append({
-                "name": "Unusual Options Activity",
-                "bias": "Bearish",
-                "confidence": conf,
-                "level": put_to_call,
-                "prediction": f"Heavy put activity: put/call vol {put_to_call:.1f}x into {expiry}",
-            })
-        return signals
-    except Exception:
-        return []
-
-def detect_news_sentiment_signal(ticker):
-    """
-    Estimate sentiment from recent headlines. This is a lightweight headline
-    sentiment model, not a full NLP/news analytics feed.
-    """
-    positive_words = {
-        "beat", "beats", "upgrade", "upgrades", "bullish", "buy", "strong",
-        "surge", "growth", "record", "profit", "profits", "winner", "wins",
-        "breakout", "raises", "raised", "expands", "partnership", "outperform"
-    }
-    negative_words = {
-        "miss", "misses", "downgrade", "downgrades", "bearish", "sell", "weak",
-        "drop", "falls", "fall", "lawsuit", "probe", "cuts", "cut", "warning",
-        "slowdown", "decline", "loss", "losses", "underperform", "risk"
-    }
-
-    headlines = []
-    if YFINANCE_OK:
-        try:
-            news_items = yf.Ticker(ticker, session=create_yahoo_session()).news or []
-            for item in news_items[:8]:
-                title = item.get("title") or item.get("content", {}).get("title")
-                if title:
-                    headlines.append(str(title))
-        except Exception:
-            pass
-
-    if len(headlines) < 3:
-        try:
-            query = urlencode({"q": f"{ticker} stock", "hl": "en-US", "gl": "US", "ceid": "US:en"})
-            resp = requests.get(
-                f"https://news.google.com/rss/search?{query}",
-                timeout=10,
-                verify=get_requests_verify_setting(),
+        ticker = yf.Ticker(symbol, session=create_yahoo_session())
+        available = ticker.options
+        if not available:
+            return None
+        if expiration_date is not None:
+            exp_str = min(
+                available,
+                key=lambda d: abs((datetime.strptime(d, "%Y-%m-%d").date() - expiration_date).days),
             )
-            if resp.status_code == 200:
-                root = ET.fromstring(resp.content)
-                for item in root.findall(".//item/title")[:8]:
-                    if item.text:
-                        headlines.append(item.text)
-        except Exception:
-            pass
-
-    if not headlines:
-        return []
-
-    score = 0
-    matches = 0
-    for headline in headlines[:8]:
-        text = headline.lower()
-        pos = sum(1 for word in positive_words if word in text)
-        neg = sum(1 for word in negative_words if word in text)
-        if pos or neg:
-            matches += 1
-        score += pos - neg
-
-    if score > 0:
-        bias = "Bullish"
-        confidence = min(80, 52 + min(score * 6, 20) + min(matches * 2, 8))
-        prediction = f"Recent headlines lean positive across {len(headlines[:8])} items"
-    elif score < 0:
-        bias = "Bearish"
-        confidence = min(80, 52 + min(abs(score) * 6, 20) + min(matches * 2, 8))
-        prediction = f"Recent headlines lean negative across {len(headlines[:8])} items"
-    else:
-        bias = "Neutral"
-        confidence = 48
-        prediction = f"Recent headlines look mixed across {len(headlines[:8])} items"
-
-    return [{
-        "name": "News Sentiment",
-        "bias": bias,
-        "confidence": confidence,
-        "level": float(len(headlines[:8])),
-        "prediction": prediction,
-    }]
-
-def score_ticker_signal_set(rows):
-    technical_rows = []
-    sentiment_rows = []
-    for row in rows:
-        name = row.get("name", "")
-        if name in {"Unusual Options Activity", "News Sentiment"}:
-            sentiment_rows.append(row)
         else:
-            technical_rows.append(row)
+            exp_str = available[0]
+        opt = ticker.option_chain(exp_str)
+        chain = {
+            "calls": {}, "puts": {},
+            "expiration": datetime.strptime(exp_str, "%Y-%m-%d").date(),
+            "source": "yahoo",
+        }
+        def safe_num(val, cast, default=0):
+            # yfinance leaves thinly-traded strikes as NaN, and `NaN or default`
+            # doesn't fall through (NaN is truthy), so int()/float() on it raises.
+            try:
+                if val is None or val != val:
+                    return default
+                return cast(val)
+            except (TypeError, ValueError):
+                return default
 
-    def avg_score(items):
-        if not items:
-            return 5.0
-        total = 0.0
-        for item in items:
-            conf = item.get("confidence", 50)
-            bias = item.get("bias", "Neutral")
-            base = conf / 10.0
-            if bias == "Bullish":
-                total += max(5.0, base)
-            elif bias == "Bearish":
-                total += min(5.0, 10 - base)
-            else:
-                total += 5.0
-        return max(1.0, min(10.0, total / len(items)))
+        for side, df in (("calls", opt.calls), ("puts", opt.puts)):
+            if df is None:
+                continue
+            for _, row in df.iterrows():
+                strike = float(row["strike"])
+                chain[side][strike] = {
+                    "bid": safe_num(row.get("bid"), float),
+                    "ask": safe_num(row.get("ask"), float),
+                    "last": safe_num(row.get("lastPrice"), float),
+                    "iv": safe_num(row.get("impliedVolatility"), float),
+                    "open_interest": safe_num(row.get("openInterest"), int),
+                    "volume": safe_num(row.get("volume"), int),
+                    "delta": None,
+                    "theta": None,
+                }
+        _chain_cache_set(cache_key, chain)
+        return chain
+    except Exception as e:
+        print(f"Yahoo option chain error for {symbol}: {e}")
+        return None
 
-    tech = round(avg_score(technical_rows), 1)
-    sent = round(avg_score(sentiment_rows), 1)
-    combined = round((tech * 0.7) + (sent * 0.3), 1)
+def fetch_option_chain(symbol, expiration_date=None):
+    """Fetch a real options chain, preferring the active DATA_SOURCE with a fallback."""
+    if symbol in ETF_SYMBOLS:
+        return None
+    chain = None
+    if DATA_SOURCE == "schwab":
+        chain = fetch_option_chain_schwab(symbol, expiration_date)
+    if not chain:
+        chain = fetch_option_chain_yahoo(symbol, expiration_date)
+    return chain
 
-    if combined >= 7.5:
-        signal = "STRONG BUY"
-        color = GREEN
-        icon = "FIRE"
-    elif combined >= 6.2:
-        signal = "BUY"
-        color = GREEN
-        icon = "UP"
-    elif combined <= 3.5:
-        signal = "STRONG SELL"
-        color = RED
-        icon = "DOWN"
-    elif combined <= 4.5:
-        signal = "SELL"
-        color = RED
-        icon = "DOWN"
-    else:
-        signal = "HOLD"
-        color = YELLOW
-        icon = "WAIT"
+def nearest_chain_quote(chain, side, target_strike):
+    """
+    Return the {bid, ask, iv, open_interest, ...} entry closest to
+    target_strike, or None if the chain is missing or has no usable
+    (non-zero bid/ask) quote near that strike.
+    """
+    if not chain:
+        return None
+    strikes = chain.get(side) or {}
+    if not strikes:
+        return None
+    closest = min(strikes.keys(), key=lambda k: abs(k - target_strike))
+    quote = strikes[closest]
+    if quote["bid"] <= 0 and quote["ask"] <= 0:
+        return None
+    quote = dict(quote)
+    quote["strike"] = closest
+    return quote
 
-    return {
-        "technical": tech,
-        "sentiment": sent,
-        "combined": combined,
-        "signal": signal,
-        "color": color,
-        "icon": icon,
-    }
+def real_or_estimated_premium(ticker, price, strike, expiration_date, dte, iv=0.28):
+    """
+    Covered-call premium for one strike: real chain mid-price when a liquid
+    quote exists, else the Black-Scholes estimate. Returns (premium, source)
+    where source is "chain" or "estimate" so callers/UI can label which one
+    they're showing.
+    """
+    quote = nearest_chain_quote(fetch_option_chain(ticker, expiration_date), "calls", strike)
+    if quote:
+        mid = (quote["bid"] + quote["ask"]) / 2 if quote["ask"] > 0 else quote["bid"]
+        if mid > 0:
+            return round(mid, 2), "chain"
+    return est_premium(price, strike, dte=dte, iv=iv), "estimate"
 
-def get_signal(price, rsi, ma50, ma200):
-    a50 = price > ma50   if ma50  else False
-    a200 = price > ma200 if ma200 else False
-    if rsi < 32:                      return "STRONG BUY",  GREEN,  "🟢"
-    if rsi < 43 and a50:              return "BUY",          GREEN,  "🟢"
-    if rsi > 74:                      return "STRONG SELL",  RED,    "🔴"
-    if rsi > 64 and not a50:          return "SELL",         RED,    "🔴"
-    if a50 and a200 and rsi > 50:     return "BULLISH",      ACCENT2,"🔵"
-    if not a50 and not a200:          return "BEARISH",      YELLOW, "🟡"
-    return "HOLD", TEXT2, "⚪"
+# ─────────────────────────────────────────
+#  INDICATORS
+#  (calc_rsi/calc_ma/calc_atr/find_local_extrema/get_signal, detect_patterns,
+#   detect_statistical_signals, detect_advanced_technical_signals,
+#   detect_ml_forecast_signal, detect_options_flow_signal,
+#   detect_news_sentiment_signal, score_ticker_signal_set now live in
+#   indicators.py / signals.py — imported above)
+# ─────────────────────────────────────────
 
 def est_premium(price, strike, dte=14, iv=0.28):
     mono = (strike - price) / price
     tf = dte / 365
     disc = max(0, 1 - mono * 8)
     return round(max(price * iv * math.sqrt(tf) * 0.4 * disc, 0.05), 2)
+
+def cc_decision(price, strike, iv, dte, earnings_days=None):
+    """Covered call decision: status, action recommendation, and next-Friday suggestion."""
+    t = max(dte, 1) / 365
+    itm = price >= strike
+    distance = price - strike
+    distance_pct = (distance / strike * 100) if strike else 0
+
+    assign_prob = probability_above_strike(price, strike, t, iv)
+    safe_pct = (1 - assign_prob) * 100
+
+    prem_now = bs_call(price, strike, t, iv)
+    prem_tm1 = bs_call(price, strike, max(t - 1 / 365, 1e-6), iv)
+    theta_day = max(prem_now - prem_tm1, 0) * 100  # per contract (100 shares)
+
+    if earnings_days is not None and 0 <= earnings_days <= 7:
+        action = f"CLOSE BEFORE EARNINGS  —  {earnings_days}d away, exit to avoid overnight gap risk"
+        action_color = RED
+    elif itm and distance_pct >= 3:
+        action = f"ROLL UP  —  Stock ${abs(distance):.2f} ({abs(distance_pct):.1f}%) above strike, buy to close & sell higher"
+        action_color = YELLOW
+    elif itm:
+        action = "NEAR ASSIGNMENT  —  Consider rolling up to protect upside"
+        action_color = YELLOW
+    elif dte <= 3:
+        action = "LET EXPIRE  —  Deep OTM with ≤3 days left, hold for max premium"
+        action_color = GREEN
+    elif distance_pct <= -5:
+        action = "HOLD  —  Stock well below strike, on track for full premium"
+        action_color = GREEN
+    elif distance_pct <= -2:
+        action = "HOLD  —  Watch for move toward strike this week"
+        action_color = GREEN
+    else:
+        action = "WATCH  —  Stock near strike, be ready to roll if it pushes through"
+        action_color = YELLOW
+
+    step = strike_step_for_price(price)
+    nxt_exp = next_friday()
+    nxt_dte = max((nxt_exp - date.today()).days, 1)
+    nxt_t = nxt_dte / 365
+    nxt_strike = round_to_strike(price * 1.05, step)
+    nxt_prem = round(max(bs_call(price, nxt_strike, nxt_t, iv), 0.05), 2)
+    nxt_safe = (1 - probability_above_strike(price, nxt_strike, nxt_t, iv)) * 100
+
+    return {
+        "itm": itm,
+        "distance": distance,
+        "distance_pct": distance_pct,
+        "safe_pct": safe_pct,
+        "theta_day": theta_day,
+        "action": action,
+        "action_color": action_color,
+        "nxt_strike": nxt_strike,
+        "nxt_prem": nxt_prem,
+        "nxt_safe": nxt_safe,
+        "nxt_dte": nxt_dte,
+        "nxt_expiry": nxt_exp,
+    }
 
 # ─────────────────────────────────────────
 #  SPREAD SCANNER UNIVERSE
@@ -1253,14 +1110,6 @@ def get_rebalanced_scan_universe():
     _save_momentum_cache(cache)
     return symbols
 
-def calc_atr(highs, lows, closes, n=14):
-    if len(closes) < n + 1: return 0
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-        trs.append(tr)
-    return round(sum(trs[-n:]) / n, 2)
-
 def estimate_iv(price, atr):
     if price <= 0 or atr <= 0: return 0.25
     return round(min(max((atr / price) * math.sqrt(252), 0.10), 2.0), 3)
@@ -1330,7 +1179,7 @@ def probability_below_strike(price, strike, time_to_expiry, iv):
 def probability_above_strike(price, strike, time_to_expiry, iv):
     return 1.0 - probability_below_strike(price, strike, time_to_expiry, iv)
 
-def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_date):
+def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_date, use_live_chain=True):
     """Score a stock for spread quality. Returns dict of metrics."""
     if len(closes) < 22 or price <= 0:
         return None
@@ -1452,9 +1301,16 @@ def score_for_spreads(ticker, closes, highs, lows, price, change_pct, expiry_dat
     bear_break_even = round(bear_buy - bear_debit, 2)
     bear_wrong_way = probability_above_strike(price, bear_break_even, time_to_expiry, iv)
 
-    # Covered Call strikes
-    cc_strike  = round_to_strike(price * 1.05, strike_step)   # ~5% OTM call
-    cc_premium = round(max(bs_call(price, cc_strike, time_to_expiry, iv), 0.05), 2)
+    # Covered Call strikes — prefer a real chain quote over the Black-Scholes
+    # estimate when one's available; snap the strike to whatever's actually
+    # listed near our ~5% OTM target instead of the theoretical strike.
+    cc_strike = round_to_strike(price * 1.05, strike_step)   # ~5% OTM call
+    cc_quote = nearest_chain_quote(fetch_option_chain(ticker, expiry_date), "calls", cc_strike) if use_live_chain else None
+    if cc_quote:
+        cc_strike = cc_quote["strike"]
+        cc_premium = round((cc_quote["bid"] + cc_quote["ask"]) / 2 if cc_quote["ask"] > 0 else cc_quote["bid"], 2)
+    else:
+        cc_premium = round(max(bs_call(price, cc_strike, time_to_expiry, iv), 0.05), 2)
     cc_yield_pct  = round(cc_premium / price * 100, 2)
     cc_annualized = round(cc_yield_pct * (365 / dte), 1)       # annualised %
     cc_break_even = round(price - cc_premium, 2)               # downside to break-even
@@ -1504,6 +1360,7 @@ def fetch_scan_data(ticker, period="1y"):
             "closes":     [float(x) for x in h["Close"].tolist()],
             "highs":      [float(x) for x in h["High"].tolist()],
             "lows":       [float(x) for x in h["Low"].tolist()],
+            "volumes":    [float(x) for x in h["Volume"].tolist()],
             "price":      price,
             "change_pct": (price - prev) / prev * 100 if prev else 0,
         }
@@ -1647,6 +1504,90 @@ def is_demo_mode():
     if DATA_SOURCE == "yahoo":
         return not YFINANCE_OK
     return APP_KEY == DEFAULT_APP_KEY
+
+# ─────────────────────────────────────────
+#  TOOLTIP HELPER
+# ─────────────────────────────────────────
+class Tooltip:
+    """Show a dark popup label when hovering over a widget."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text   = text
+        self._win   = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, event=None):
+        if self._win:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self._win = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+        tk.Label(
+            tw, text=self.text,
+            font=("Courier New", 10),
+            bg=BG3, fg=TEXT,
+            relief="flat", padx=12, pady=8,
+            justify="left",
+            highlightbackground=BORDER, highlightthickness=1,
+        ).pack()
+
+    def _hide(self, event=None):
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+
+TOOLTIP_TECH = (
+    "TECH SCORE  (1 – 10)\n"
+    "─────────────────────────────────────\n"
+    "Average of all price/chart signals:\n"
+    "  • Chart patterns  (Head & Shoulders, Double Bottom,\n"
+    "    Bull Flag, Cup & Handle, Death Cross)\n"
+    "  • Moving Average Forecast  (MA5 vs MA20 slope)\n"
+    "  • Mean Reversion  (RSI extremes ≤ 20 / ≥ 80)\n"
+    "  • ATR Range  (expected near-term move)\n"
+    "  • MACD  (crossover or histogram direction)\n"
+    "  • ADX Trend Strength  (Wilder's ADX + ±DI)\n"
+    "  • Bollinger / Keltner Squeeze  (volatility breakout)\n"
+    "  • Volume Flow  (OBV slope + CMF)\n"
+    "  • ML Forecast  (momentum/trend feature model)\n"
+    "\n"
+    "Scoring per signal:\n"
+    "  Bullish → max(5, conf/10)   Bearish → min(5, 10−conf/10)\n"
+    "  Neutral → 5.0\n"
+    "Then averaged across all signals → Tech score."
+)
+
+TOOLTIP_SENT = (
+    "SENTIMENT SCORE  (1 – 10)\n"
+    "─────────────────────────────────────\n"
+    "Average of non-price signals:\n"
+    "  • News Sentiment  (headline keyword scoring)\n"
+    "  • Unusual Options Activity  (call/put vol vs OI)\n"
+    "\n"
+    "Same scoring formula as Tech:\n"
+    "  Bullish → max(5, conf/10)   Bearish → min(5, 10−conf/10)\n"
+    "  Neutral → 5.0"
+)
+
+TOOLTIP_COMBINED = (
+    "COMBINED SCORE  (1 – 10)\n"
+    "─────────────────────────────────────\n"
+    "  Combined = (Tech × 0.7) + (Sent × 0.3)\n"
+    "\n"
+    "Thresholds:\n"
+    "  ≥ 7.5  →  STRONG BUY\n"
+    "  ≥ 6.2  →  BUY\n"
+    "  ≤ 3.5  →  STRONG SELL\n"
+    "  ≤ 4.5  →  SELL\n"
+    "  else   →  HOLD"
+)
+
 
 # ─────────────────────────────────────────
 #  MAIN APP
@@ -2244,26 +2185,54 @@ class TradingApp(tk.Tk):
         )
         self.detail_earnings_info.pack(anchor="w", pady=(0,6))
 
-        # Covered call action row
+        # Covered call decision section
         sep2 = tk.Frame(parent, bg=BORDER, height=1)
         sep2.pack(fill="x", padx=14, pady=8)
 
-        action = tk.Frame(parent, bg=CARD, padx=14)
-        action.pack(fill="x")
+        cc_frame = tk.Frame(parent, bg=CARD, padx=14)
+        cc_frame.pack(fill="x", pady=(0, 6))
+
         self.detail_call_title = tk.Label(
-            action,
-            text=f"COVERED CALL - {covered_call_expiry_label()} Expiry",
-            font=self.f_small,
-            bg=CARD,
-            fg=TEXT3
+            cc_frame,
+            text=f"COVERED CALL DECISION — {covered_call_expiry_label()} Expiry",
+            font=self.f_small, bg=CARD, fg=TEXT3,
         )
-        self.detail_call_title.pack(anchor="w", pady=(0,6))
+        self.detail_call_title.pack(anchor="w", pady=(0, 5))
 
-        self.detail_call = tk.Label(action, text="", font=self.f_head, bg=CARD, fg=ACCENT2)
-        self.detail_call.pack(anchor="w")
+        # Three status mini-boxes: strike status / assign risk / theta
+        status_row = tk.Frame(cc_frame, bg=CARD)
+        status_row.pack(fill="x", pady=(0, 4))
+        for col_title in ("STRIKE STATUS", "ASSIGN RISK", "THETA/DAY"):
+            col = tk.Frame(status_row, bg=BG3, padx=8, pady=5)
+            col.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            tk.Label(col, text=col_title, font=self.f_small, bg=BG3, fg=TEXT3).pack(anchor="w")
+            lbl = tk.Label(col, text="—", font=self.f_head, bg=BG3, fg=TEXT)
+            lbl.pack(anchor="w")
+            if col_title == "STRIKE STATUS":
+                self.cc_status_lbl = lbl
+            elif col_title == "ASSIGN RISK":
+                self.cc_safe_lbl = lbl
+            else:
+                self.cc_theta_lbl = lbl
 
-        self.detail_earn = tk.Label(action, text="", font=self.f_small, bg=CARD, fg=YELLOW)
-        self.detail_earn.pack(anchor="w", pady=(4,0))
+        # Action recommendation
+        self.cc_action_lbl = tk.Label(
+            cc_frame, text="", font=self.f_head, bg=CARD, fg=GREEN,
+            wraplength=400, justify="left",
+        )
+        self.cc_action_lbl.pack(anchor="w", pady=(4, 3))
+
+        # Current position and next-Friday suggestion
+        self.cc_current_lbl = tk.Label(cc_frame, text="", font=self.f_small, bg=CARD, fg=TEXT2)
+        self.cc_current_lbl.pack(anchor="w")
+        self.cc_next_lbl = tk.Label(cc_frame, text="", font=self.f_small, bg=CARD, fg=ACCENT2)
+        self.cc_next_lbl.pack(anchor="w", pady=(2, 0))
+
+        self.detail_call = tk.Label(cc_frame, text="", font=self.f_small, bg=CARD, fg=TEXT2)
+        self.detail_call.pack(anchor="w", pady=(4, 0))
+
+        self.detail_earn = tk.Label(cc_frame, text="", font=self.f_small, bg=CARD, fg=YELLOW)
+        self.detail_earn.pack(anchor="w", pady=(5, 0))
 
     # ═══════════════════════════════════════
     #  TAB 2 — CHARTS
@@ -2467,6 +2436,13 @@ class TradingApp(tk.Tk):
             tk.Label(hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
                      width=w//7, anchor="w").pack(side="left", padx=6, pady=6)
 
+        legend = tk.Frame(cols_frame, bg=BG)
+        legend.pack(anchor="w", pady=(4, 0))
+        tk.Label(legend, text="●", font=self.f_small, bg=BG, fg=ACCENT2).pack(side="left")
+        tk.Label(legend, text=" live chain quote     ", font=self.f_small, bg=BG, fg=TEXT2).pack(side="left")
+        tk.Label(legend, text="●", font=self.f_small, bg=BG, fg=TEXT3).pack(side="left")
+        tk.Label(legend, text=" model estimate (no liquid quote found)", font=self.f_small, bg=BG, fg=TEXT2).pack(side="left")
+
         self.income_rows = {}
         for ticker in PORTFOLIO.keys():
             row_frame = tk.Frame(cols_frame, bg=CARD,
@@ -2641,6 +2617,7 @@ class TradingApp(tk.Tk):
     def _build_patterns(self, parent):
         self.pattern_results = []
         self.pattern_collapsed = {}
+        self.custom_pattern_tickers = []
 
         top = tk.Frame(parent, bg=BG)
         top.pack(fill="x", padx=12, pady=(12, 6))
@@ -2658,6 +2635,11 @@ class TradingApp(tk.Tk):
                   bg=ACCENT, fg=WHITE, relief="flat", cursor="hand2",
                   padx=16, pady=6,
                   command=self._run_pattern_scan).pack(side="right")
+
+        tk.Button(top, text="+ ADD STOCK", font=self.f_head,
+                  bg=BG3, fg=TEXT, relief="flat", cursor="hand2",
+                  padx=16, pady=6,
+                  command=self._add_pattern_ticker).pack(side="right", padx=(0, 8))
 
         explainer = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         explainer.pack(fill="x", padx=12, pady=(0, 8))
@@ -2703,46 +2685,69 @@ class TradingApp(tk.Tk):
         tk.Label(self.pattern_table, text="Press SCAN PATTERNS to detect chart and statistical setups.",
                  font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
 
+    def _add_pattern_ticker(self):
+        ticker = simpledialog.askstring(
+            "Add Stock",
+            "Enter a ticker symbol to include in the Pattern Detector scan:",
+            parent=self,
+        )
+        if not ticker:
+            return
+        ticker = ticker.strip().upper()
+        if not ticker:
+            return
+        if ticker not in self.custom_pattern_tickers and ticker not in PORTFOLIO and ticker not in SCAN_UNIVERSE:
+            self.custom_pattern_tickers.append(ticker)
+        self.pattern_status.config(text=f"Added {ticker}. Scanning...", fg=YELLOW)
+        self._run_pattern_scan()
+
     def _run_pattern_scan(self):
         self.pattern_status.config(text="Scanning chart, statistical, options, and ML-style signals...", fg=YELLOW)
         self.after(10, self._finish_pattern_scan)
 
     def _finish_pattern_scan(self):
         symbols = []
-        for ticker in list(PORTFOLIO.keys()) + list(SCAN_UNIVERSE):
+        for ticker in list(PORTFOLIO.keys()) + list(SCAN_UNIVERSE) + list(self.custom_pattern_tickers):
             if ticker not in symbols:
                 symbols.append(ticker)
+        threading.Thread(target=self._pattern_scan_worker, args=(symbols,), daemon=True).start()
 
+    def _scan_one_ticker(self, ticker):
+        data = fetch_scan_data(ticker, period="1y")
+        if not data:
+            return []
+        rows = []
+        for sig in detect_patterns(data["closes"]):
+            rows.append({"ticker": ticker, **sig})
+        for sig in detect_statistical_signals(data["closes"], data["highs"], data["lows"]):
+            rows.append({"ticker": ticker, **sig})
+        for sig in detect_advanced_technical_signals(data["closes"], data["highs"], data["lows"], data.get("volumes")):
+            rows.append({"ticker": ticker, **sig})
+        for sig in detect_ml_forecast_signal(data["closes"], data["highs"], data["lows"]):
+            rows.append({"ticker": ticker, **sig})
+        for sig in detect_options_flow_signal(ticker):
+            rows.append({"ticker": ticker, **sig})
+        for sig in detect_news_sentiment_signal(ticker):
+            rows.append({"ticker": ticker, **sig})
+        return rows
+
+    def _pattern_scan_worker(self, symbols):
         results = []
-        for idx, ticker in enumerate(symbols):
-            self.pattern_status.config(text=f"Scanning {idx + 1}/{len(symbols)}: {ticker}...", fg=YELLOW)
-            data = fetch_scan_data(ticker, period="1y")
-            if not data:
-                continue
-            for pattern in detect_patterns(data["closes"]):
-                row = {"ticker": ticker}
-                row.update(pattern)
-                results.append(row)
-            for signal in detect_statistical_signals(data["closes"], data["highs"], data["lows"]):
-                row = {"ticker": ticker}
-                row.update(signal)
-                results.append(row)
-            for signal in detect_ml_forecast_signal(data["closes"], data["highs"], data["lows"]):
-                row = {"ticker": ticker}
-                row.update(signal)
-                results.append(row)
-            for signal in detect_options_flow_signal(ticker):
-                row = {"ticker": ticker}
-                row.update(signal)
-                results.append(row)
-            for signal in detect_news_sentiment_signal(ticker):
-                row = {"ticker": ticker}
-                row.update(signal)
-                results.append(row)
-
+        done = 0
+        total = len(symbols)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(self._scan_one_ticker, t): t for t in symbols}
+            for future in as_completed(futures):
+                done += 1
+                self.after(0, lambda d=done: self.pattern_status.config(
+                    text=f"Scanning {d}/{total}...", fg=YELLOW))
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    pass
         self.pattern_results = sorted(results, key=lambda r: (r["ticker"], -r["confidence"], r["name"]))
-        self.pattern_collapsed = {ticker: True for ticker in {row["ticker"] for row in self.pattern_results}}
-        self._render_pattern_results()
+        self.pattern_collapsed = {t: True for t in {r["ticker"] for r in self.pattern_results}}
+        self.after(0, self._render_pattern_results)
 
     def _render_pattern_results(self):
         for w in self.pattern_table.winfo_children():
@@ -2756,7 +2761,7 @@ class TradingApp(tk.Tk):
 
         self.pattern_status.config(text=f"Pattern scan complete - {len(self.pattern_results)} signals ranked", fg=GREEN)
         grouped = {}
-        for row in self.pattern_results[:60]:
+        for row in self.pattern_results:
             grouped.setdefault(row["ticker"], []).append(row)
 
         for ticker in sorted(grouped.keys()):
@@ -2784,9 +2789,15 @@ class TradingApp(tk.Tk):
             tk.Label(header, text=top_signal["name"], font=self.f_small, bg=BG3, fg=TEXT2, width=20, anchor="w").pack(side="left", padx=5)
             tk.Label(header, text=top_signal["bias"], font=self.f_small, bg=BG3, fg=bias_color, width=10, anchor="w").pack(side="left", padx=5)
             tk.Label(header, text=f"{len(rows)} signals", font=self.f_small, bg=BG3, fg=ACCENT2, width=10, anchor="w").pack(side="left", padx=5)
-            tk.Label(header, text=f"Tech {scorecard['technical']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w").pack(side="left", padx=5)
-            tk.Label(header, text=f"Sent {scorecard['sentiment']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w").pack(side="left", padx=5)
-            tk.Label(header, text=f"{scorecard['signal']} {scorecard['combined']:.1f}/10", font=self.f_small, bg=BG3, fg=scorecard["color"], width=18, anchor="w").pack(side="left", padx=5)
+            lbl_tech = tk.Label(header, text=f"Tech {scorecard['technical']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w", cursor="question_arrow")
+            lbl_tech.pack(side="left", padx=5)
+            Tooltip(lbl_tech, TOOLTIP_TECH)
+            lbl_sent = tk.Label(header, text=f"Sent {scorecard['sentiment']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w", cursor="question_arrow")
+            lbl_sent.pack(side="left", padx=5)
+            Tooltip(lbl_sent, TOOLTIP_SENT)
+            lbl_comb = tk.Label(header, text=f"{scorecard['signal']} {scorecard['combined']:.1f}/10", font=self.f_small, bg=BG3, fg=scorecard["color"], width=18, anchor="w", cursor="question_arrow")
+            lbl_comb.pack(side="left", padx=5)
+            Tooltip(lbl_comb, TOOLTIP_COMBINED)
 
             if self.pattern_collapsed[ticker]:
                 continue
@@ -2940,6 +2951,8 @@ class TradingApp(tk.Tk):
         self.gainers_table = tk.Frame(gainers, bg=BG)
         self.gainers_table.pack(fill="both", expand=True)
 
+        tk.Frame(split, bg=BORDER, width=1).pack(side="left", fill="y", padx=4)
+
         losers = tk.Frame(split, bg=BG)
         losers.pack(side="left", fill="both", expand=True, padx=(4, 4))
         tk.Label(losers, text="BIGGEST LOSERS", font=self.f_head, bg=BG, fg=RED).pack(anchor="w", pady=(0, 6))
@@ -2950,6 +2963,8 @@ class TradingApp(tk.Tk):
                      width=w, anchor="w").pack(side="left", padx=5, pady=6)
         self.losers_table = tk.Frame(losers, bg=BG)
         self.losers_table.pack(fill="both", expand=True)
+
+        tk.Frame(split, bg=BORDER, width=1).pack(side="left", fill="y", padx=4)
 
         volume = tk.Frame(split, bg=BG)
         volume.pack(side="left", fill="both", expand=True, padx=(4, 0))
@@ -2968,6 +2983,153 @@ class TradingApp(tk.Tk):
                  font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
         tk.Label(self.volume_table, text="Refreshing movers with market data...",
                  font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+
+        # ── Signal analysis section ──────────────────────────────────────
+        self.movers_signal_results = []
+        self.movers_signal_collapsed = {}
+
+        sig_sep = tk.Frame(parent, bg=BORDER, height=1)
+        sig_sep.pack(fill="x", padx=12, pady=(8, 0))
+
+        sig_top = tk.Frame(parent, bg=BG)
+        sig_top.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(sig_top, text="Signal Analysis", font=self.f_head, bg=BG, fg=TEXT).pack(side="left")
+        self.movers_signal_status = tk.Label(
+            sig_top,
+            text="Click SCAN SIGNALS to run pattern, momentum, ADX, and volume-flow analysis on the current top movers.",
+            font=self.f_small, bg=BG, fg=TEXT2,
+        )
+        self.movers_signal_status.pack(side="left", padx=16)
+        tk.Button(sig_top, text="SCAN SIGNALS", font=self.f_head,
+                  bg=ACCENT, fg=WHITE, relief="flat", cursor="hand2",
+                  padx=16, pady=6,
+                  command=self._run_movers_scan).pack(side="right")
+
+        sig_table_frame = tk.Frame(parent, bg=BG)
+        sig_table_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        sig_hdr = tk.Frame(sig_table_frame, bg=BG3)
+        sig_hdr.pack(fill="x")
+        for h, w in [("TICKER", 8), ("TOP SIGNAL", 20), ("BIAS", 10), ("SIGNALS", 10), ("TECH", 13), ("SENT", 13), ("COMBINED", 18)]:
+            tk.Label(sig_hdr, text=h, font=self.f_small, bg=BG3, fg=TEXT3,
+                     width=w, anchor="w").pack(side="left", padx=5, pady=6)
+
+        sig_scroll_frame = tk.Frame(sig_table_frame, bg=BG)
+        sig_scroll_frame.pack(fill="both", expand=True)
+        self.movers_sig_canvas = tk.Canvas(sig_scroll_frame, bg=BG, highlightthickness=0)
+        sig_sb = ttk.Scrollbar(sig_scroll_frame, orient="vertical", command=self.movers_sig_canvas.yview)
+        sig_sb.pack(side="right", fill="y")
+        self.movers_sig_canvas.pack(fill="both", expand=True)
+        self.movers_sig_canvas.configure(yscrollcommand=sig_sb.set)
+        self.movers_signal_table = tk.Frame(self.movers_sig_canvas, bg=BG)
+        self.movers_sig_canvas.create_window((0, 0), window=self.movers_signal_table, anchor="nw")
+        self.movers_signal_table.bind("<Configure>", lambda e: self.movers_sig_canvas.configure(
+            scrollregion=self.movers_sig_canvas.bbox("all")))
+        tk.Label(self.movers_signal_table,
+                 text="Press SCAN SIGNALS to analyse the current top gainers and losers.",
+                 font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+
+    def _run_movers_scan(self):
+        self.movers_signal_status.config(text="Scanning signals for top movers...", fg=YELLOW)
+        universe_data = [
+            (ticker, d) for ticker in self.movers_universe
+            if (d := self.stock_data.get(ticker)) and d.get("price")
+        ]
+        gainers = sorted(universe_data, key=lambda x: x[1].get("pct", 0), reverse=True)[:10]
+        losers  = sorted(universe_data, key=lambda x: x[1].get("pct", 0))[:10]
+        scan_tickers = list({t for t, _ in gainers + losers})
+        threading.Thread(target=self._movers_scan_worker, args=(scan_tickers,), daemon=True).start()
+
+    def _movers_scan_worker(self, scan_tickers):
+        results = []
+        done = 0
+        total = len(scan_tickers)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(self._scan_one_ticker, t): t for t in scan_tickers}
+            for future in as_completed(futures):
+                done += 1
+                self.after(0, lambda d=done: self.movers_signal_status.config(
+                    text=f"Scanning {d}/{total}...", fg=YELLOW))
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    pass
+        self.movers_signal_results = sorted(results, key=lambda r: (r["ticker"], -r["confidence"], r["name"]))
+        self.movers_signal_collapsed = {t: True for t in {r["ticker"] for r in self.movers_signal_results}}
+        self.after(0, self._render_movers_signals)
+
+    def _render_movers_signals(self):
+        for w in self.movers_signal_table.winfo_children():
+            w.destroy()
+
+        if not self.movers_signal_results:
+            self.movers_signal_status.config(text="No signal data available. Try refreshing market data first.", fg=RED)
+            tk.Label(self.movers_signal_table, text="No results. Make sure market data has loaded (wait for Refresh).",
+                     font=self.f_body, bg=BG, fg=TEXT3).pack(pady=24)
+            return
+
+        self.movers_signal_status.config(
+            text=f"Signal scan complete — {len(self.movers_signal_results)} signals across "
+                 f"{len({r['ticker'] for r in self.movers_signal_results})} movers", fg=GREEN)
+        grouped = {}
+        for row in self.movers_signal_results:
+            grouped.setdefault(row["ticker"], []).append(row)
+
+        for ticker in sorted(grouped.keys()):
+            rows = grouped[ticker]
+            self.movers_signal_collapsed.setdefault(ticker, False)
+            top_signal = rows[0]
+            scorecard = score_ticker_signal_set(rows)
+            bias_color = GREEN if top_signal["bias"] == "Bullish" else RED if top_signal["bias"] == "Bearish" else YELLOW
+
+            header = tk.Frame(self.movers_signal_table, bg=BG3, highlightbackground=BORDER, highlightthickness=1)
+            header.pack(fill="x", pady=(4, 1))
+            toggle_text = "+" if self.movers_signal_collapsed[ticker] else "-"
+            tk.Button(header, text=toggle_text, font=self.f_small, bg=BG3, fg=TEXT,
+                      relief="flat", cursor="hand2", width=2,
+                      command=lambda t=ticker: self._toggle_movers_signal_ticker(t),
+                      ).pack(side="left", padx=(6, 8), pady=6)
+            tk.Label(header, text=ticker,          font=self.f_mono,  bg=BG3, fg=TEXT,       width=8,  anchor="w").pack(side="left", padx=5)
+            tk.Label(header, text=top_signal["name"], font=self.f_small, bg=BG3, fg=TEXT2,    width=20, anchor="w").pack(side="left", padx=5)
+            tk.Label(header, text=top_signal["bias"], font=self.f_small, bg=BG3, fg=bias_color, width=10, anchor="w").pack(side="left", padx=5)
+            tk.Label(header, text=f"{len(rows)} signals", font=self.f_small, bg=BG3, fg=ACCENT2, width=10, anchor="w").pack(side="left", padx=5)
+            lbl_tech = tk.Label(header, text=f"Tech {scorecard['technical']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w", cursor="question_arrow")
+            lbl_tech.pack(side="left", padx=5)
+            Tooltip(lbl_tech, TOOLTIP_TECH)
+            lbl_sent = tk.Label(header, text=f"Sent {scorecard['sentiment']:.1f}/10", font=self.f_small, bg=BG3, fg=TEXT, width=13, anchor="w", cursor="question_arrow")
+            lbl_sent.pack(side="left", padx=5)
+            Tooltip(lbl_sent, TOOLTIP_SENT)
+            lbl_comb = tk.Label(header, text=f"{scorecard['signal']} {scorecard['combined']:.1f}/10", font=self.f_small, bg=BG3, fg=scorecard["color"], width=18, anchor="w", cursor="question_arrow")
+            lbl_comb.pack(side="left", padx=5)
+            Tooltip(lbl_comb, TOOLTIP_COMBINED)
+
+            if self.movers_signal_collapsed[ticker]:
+                continue
+
+            for idx, row in enumerate(rows, start=1):
+                bg_c = CARD if idx % 2 else BG2
+                line = tk.Frame(self.movers_signal_table, bg=bg_c, highlightbackground=BORDER, highlightthickness=1)
+                line.pack(fill="x", pady=1)
+                row_bias_color = GREEN if row["bias"] == "Bullish" else RED if row["bias"] == "Bearish" else YELLOW
+                vals = [
+                    "",
+                    row["name"],
+                    row["bias"],
+                    f"{row['confidence']}",
+                    f"{row['level']:.2f}x" if row["name"] == "Unusual Options Activity" else (
+                        f"{int(row['level'])} news" if row["name"] == "News Sentiment" else f"${row['level']:.2f}"
+                    ),
+                    row["prediction"],
+                ]
+                widths = [8, 20, 10, 8, 10, 36]
+                for i, (val, w) in enumerate(zip(vals, widths)):
+                    fg = row_bias_color if i == 2 else ACCENT2 if i == 3 else TEXT
+                    tk.Label(line, text=val, font=self.f_mono_s if i < 5 else self.f_small,
+                             bg=bg_c, fg=fg, width=w, anchor="w").pack(side="left", padx=5, pady=8)
+
+    def _toggle_movers_signal_ticker(self, ticker):
+        self.movers_signal_collapsed[ticker] = not self.movers_signal_collapsed.get(ticker, False)
+        self._render_movers_signals()
 
     def _render_movers(self):
         if not hasattr(self, "gainers_table"):
@@ -4475,7 +4637,8 @@ class TradingApp(tk.Tk):
 
             # Income
             dte     = covered_call_dte()
-            prem    = est_premium(price, cfg["call_strike"], dte=dte)
+            expiry  = next_covered_call_expiry()
+            prem, prem_source = real_or_estimated_premium(ticker, price, cfg["call_strike"], expiry, dte)
             weekly  = prem * 100 * (cfg["shares"] // 100)
             monthly = weekly * 4.3
             total_w += weekly
@@ -4490,7 +4653,7 @@ class TradingApp(tk.Tk):
             if ticker in self.income_rows:
                 row = self.income_rows[ticker]
                 row[3].config(text=f"${price:.2f}")
-                row[4].config(text=f"${prem:.2f}")
+                row[4].config(text=f"${prem:.2f}", fg=ACCENT2 if prem_source == "chain" else TEXT3)
                 row[5].config(text=f"${weekly:.0f}", fg=ACCENT2)
                 row[6].config(text=f"${monthly:.0f}", fg=ACCENT2)
                 row[7].config(text=sig, fg=sig_color)
@@ -4616,7 +4779,8 @@ class TradingApp(tk.Tk):
                 ma200 = calc_ma(hist, 200)
             sig, sig_color, _ = get_signal(price, rsi, ma50 or price, ma200 or price)
             dte    = covered_call_dte()
-            prem   = est_premium(price, cfg["call_strike"], dte=dte)
+            expiry = next_covered_call_expiry()
+            prem, _prem_source = real_or_estimated_premium(ticker, price, cfg["call_strike"], expiry, dte)
             weekly = prem * 100 * (cfg["shares"] // 100)
             self._update_detail(ticker, d["price"], d["change"], d["pct"],
                                 rsi, ma50, ma200, sig, sig_color, prem, weekly)
