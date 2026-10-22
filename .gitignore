@@ -44,3 +44,6 @@ desktop.ini
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Local-only projects
+document_intelligence_poc/
